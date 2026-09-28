@@ -223,6 +223,18 @@ grep -q "still running" <<<"$err" || fail "unclear leftover-process error: $err"
 for _ in $(seq 20); do ov apply >/dev/null 2>&1 && break; sleep 0.5; done
 [[ $(cat "$T/sysb/f") == x ]] || fail "apply did not go through after the process exited"
 
+# Paths with the characters overlay uses as separators still stage correctly.
+W=$T/'odd,dir:with\slash'
+mkdir -p "$T/odd/.ovenv" "$W"; echo old >"$W/f"
+printf '%s\n' "$W" >"$T/odd/.ovenv/paths"
+cd "$T/odd"
+# shellcheck disable=SC2016  # $1 expands in the inner shell
+ov run sh -c 'echo new > "$1/f"' sh "$W"
+[[ $(cat "$W/f") == old ]] || fail "odd path: host changed"
+grep -qxF "MODIFY  $W/f" <<<"$(ov diff)" || fail "odd path not staged"
+ov apply >/dev/null
+[[ $(cat "$W/f") == new ]] || fail "odd path not applied"
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
