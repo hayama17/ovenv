@@ -13,7 +13,7 @@ ov() { "$OVENV" "$@"; }
 S=$T/sys
 
 mkdir -p "$T"/{proj/.ovenv,proj2/.ovenv,skiponly/.ovenv,sys2,sys3,out,share} "$S"/{bin,d,pd,deldir,d2f}
-printf '%s\n' "$S" "rw $T/share" >"$T/proj/.ovenv/paths"
+printf '%s\n' "$S" "rw $T/share" "rw ." >"$T/proj/.ovenv/paths"
 echo "$T/sys2" >"$T/proj2/.ovenv/paths"
 cd "$S"
 echo old >conf; echo old >conf2; echo old >hostgone; echo x >gone
@@ -51,6 +51,10 @@ U=$ST/upper$S
 [[ ! -e $S/emptydir && -f $S/f2d && -d $S/d2f && $(stat -c %a "$S/pd") == 755 ]] || fail "host changed"
 [[ ! -e $T/out/x && ! -e $T/proj/leak ]] || fail "write outside overlay reached the host"
 [[ -e $T/proj/built && -e $T/share/s ]] || fail "rw paths not writable"
+# 'rw .' means the project, also when ovenv runs from a subdirectory.
+mkdir -p "$T/proj/sub"
+(cd "$T/proj/sub" && ov run sh -c "echo s > $T/proj/fromsub")
+[[ -e $T/proj/fromsub ]] || fail "'rw .' resolved against the current directory"
 [[ $(cat "$T/proj/uid") == "$(id -u)" ]] || fail "uid changed inside"
 
 out=$(ov diff)
@@ -83,6 +87,9 @@ ov run sleep 2 & sleep 0.5
 err=$(ov discard 2>&1) && fail "discard allowed during a run"
 grep -q "in use" <<<"$err" || fail "unclear lock error: $err"
 (cd "$T/proj2" && ov run true && ov discard) || fail "a different .ovenv was blocked"
+# Without 'rw .' the project is read-only like anything else not listed.
+(cd "$T/proj2" && { ov run sh -c "touch $T/proj2/x" 2>/dev/null || true; } && ov discard)
+[[ ! -e $T/proj2/x ]] || fail "project writable without rw ."
 wait
 
 # Same-second content change and a deletion on the host, both after staging.
@@ -180,7 +187,7 @@ fi
 
 # A staged path inside the project is staged, although the rest of the project writes through.
 mkdir -p "$T/pc/.ovenv" "$T/pc/sys"; echo old >"$T/pc/sys/f"
-echo "$T/pc/sys" >"$T/pc/.ovenv/paths"
+printf '%s\n' "$T/pc/sys" "rw ." >"$T/pc/.ovenv/paths"
 cd "$T/pc"
 ov run sh -c "echo new > $T/pc/sys/f; echo b > $T/pc/built"
 [[ $(cat "$T/pc/sys/f") == old && -e $T/pc/built ]] || fail "staged path inside the project wrote through"

@@ -15,8 +15,15 @@ use std::process::exit;
 
 use sha2::{Digest, Sha256};
 
-const ROOT_DEFAULT: &[&str] = &["/usr", "/opt", "/etc", "/var", "/root"];
-const USER_DEFAULT: &[&str] = &["~/.local", "~/.cargo", "~/.npm", "~/.cache", "~/.config"];
+const ROOT_DEFAULT: &[&str] = &["/usr", "/opt", "/etc", "/var", "/root", "rw ."];
+const USER_DEFAULT: &[&str] = &[
+    "~/.local",
+    "~/.cargo",
+    "~/.npm",
+    "~/.cache",
+    "~/.config",
+    "rw .",
+];
 
 macro_rules! die {
     ($($a:tt)*) => {{ eprintln!("ovenv: {}", format!($($a)*)); exit(1) }};
@@ -136,7 +143,8 @@ impl Env {
             } else if let Some(rest) = p.strip_prefix("~/") {
                 home.join(rest)
             } else {
-                PathBuf::from(p)
+                // relative to the project, not to wherever ovenv happens to run
+                self.project.join(p)
             };
             out.push((rw, resolve(&p)));
         }
@@ -325,10 +333,6 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
             }
         }
         ov.push(p);
-    }
-    // A project under a staged path is staged too; otherwise it stays writable as before.
-    if !ov.iter().any(|p| env.project.starts_with(p)) {
-        rw.insert(0, env.project.clone());
     }
     // The merged root takes its mode, owner and xattrs from the upper dir, so start it as a copy of the host dir.
     for p in &ov {
@@ -1380,8 +1384,9 @@ fn init() {
         "# One path per line. Writes under these paths are staged in OverlayFS.\n\
          # Prefix with 'rw ' to let writes go straight to the host.\n\
          # Use ~ to stage your whole home directory, dotfiles included.\n\
-         # Everything else is read-only inside ovenv, except /tmp, /dev, /proc\n\
-         # and this project (unless it is under a staged path).\n{}\n",
+         # Relative paths are relative to this project. 'rw .' lets the project write\n\
+         # straight through; delete it to stage the project as well.\n\
+         # Everything else is read-only inside ovenv, except /tmp, /dev and /proc.\n{}\n",
         defaults.join("\n")
     );
     or_die(
