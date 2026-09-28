@@ -78,6 +78,12 @@ rw ~/.gnupg
 
 Relative paths are relative to the project (the parent of `.ovenv/`), wherever you run ovenv from.
 
+ovenv never creates a listed path on the host. A staged path that doesn't exist yet is staged through its nearest existing parent,
+so an installer creating `~/.bun` works when only `~/.bun` is listed; `run` says which parent it used.
+A missing `rw` path is not created either, and `run` warns about it.
+
+The staged paths are fixed when staging starts. Editing `.ovenv/paths` takes effect after `apply` or `discard`.
+
 `~` stages your whole home directory, so an installer appending to `~/.bashrc` shows up in `diff`.
 
 - Lines starting with `rw` are writable straight through to the host, even inside a staged path.

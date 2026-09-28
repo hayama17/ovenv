@@ -148,25 +148,55 @@ impl Env {
             };
             out.push((rw, resolve(&p)));
         }
-        // A path under another staged path is already staged by it; mounting both would nest one upper in the other.
-        let staged: Vec<PathBuf> = out
-            .iter()
-            .filter(|(rw, _)| !rw)
-            .map(|(_, p)| p.clone())
-            .collect();
-        let mut seen = HashSet::new();
-        out.retain(|(rw, p)| {
-            *rw || (!staged.iter().any(|q| q != p && p.starts_with(q)) && seen.insert(p.clone()))
-        });
         out
     }
 
+    /// Staged paths as `.ovenv/paths` asks for them. A path that doesn't exist yet is staged through
+    /// its nearest existing parent, so the command can create it without ovenv touching the host.
+    fn wanted_overlays(&self, notify: bool) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for (rw, p) in self.paths() {
+            if rw {
+                continue;
+            }
+            let mut q = p.as_path();
+            while !is_dir(q) {
+                match q.parent() {
+                    Some(parent) => q = parent,
+                    None => break,
+                }
+            }
+            if notify && q != p {
+                eprintln!(
+                    "ovenv: {} doesn't exist; staging {} instead",
+                    p.display(),
+                    q.display()
+                );
+            }
+            out.push(q.to_path_buf());
+        }
+        // A path under another staged path is already staged by it; mounting both would nest one upper in the other.
+        let all = out.clone();
+        let mut seen = HashSet::new();
+        out.retain(|p| !all.iter().any(|q| q != p && p.starts_with(q)) && seen.insert(p.clone()));
+        out
+    }
+
+    /// The staged paths, fixed when staging starts: editing .ovenv/paths or creating a path on the
+    /// host mid-session must not hide what is already staged.
     fn overlays(&self) -> Vec<PathBuf> {
-        self.paths()
-            .into_iter()
-            .filter(|(rw, _)| !rw)
-            .map(|(_, p)| p)
-            .collect()
+        match self
+            .state
+            .as_ref()
+            .and_then(|st| fs::read(st.join("overlays")).ok())
+        {
+            Some(data) => data
+                .split(|&b| b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| PathBuf::from(OsStr::from_bytes(p)))
+                .collect(),
+            None => self.wanted_overlays(false),
+        }
     }
 }
 
@@ -310,13 +340,32 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let mut ov = Vec::new();
     let mut rw = vec![PathBuf::from("/tmp")];
     for (is_rw, p) in env.paths() {
-        if is_rw {
-            rw.push(p);
+        if !is_rw {
             continue;
         }
+        if lstat(&p).is_none() {
+            // creating it on the host would be a side effect ovenv exists to avoid
+            eprintln!(
+                "ovenv: rw path {} doesn't exist on the host; writes there are staged or refused",
+                p.display()
+            );
+        }
+        rw.push(p);
+    }
+    let recorded = env.state().join("overlays");
+    let fresh = lstat(&recorded).is_none();
+    let candidates = if fresh {
+        env.wanted_overlays(true)
+    } else {
+        if env.overlays() != env.wanted_overlays(false) {
+            eprintln!("ovenv: .ovenv/paths changed since staging started; the staged paths stay until apply or discard");
+        }
+        env.overlays()
+    };
+    let mut ov = Vec::new();
+    for p in candidates {
         if env.state().starts_with(&p) {
             die!(
                 "cannot stage {}: ovenv keeps staged changes in {}",
@@ -334,16 +383,19 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
         }
         ov.push(p);
     }
+    if fresh {
+        let list: Vec<u8> = ov
+            .iter()
+            .flat_map(|p| p.as_os_str().as_bytes().iter().copied().chain([0]))
+            .collect();
+        or_die(fs::write(&recorded, list), "cannot record the staged paths");
+    }
     // The merged root takes its mode, owner and xattrs from the upper dir, so start it as a copy of the host dir.
     for p in &ov {
         let upper = env.upper(p);
         if lstat(&upper).is_some() {
             continue;
         }
-        or_die(
-            fs::create_dir_all(p),
-            format!("cannot create {}", p.display()),
-        );
         if let Some(parent) = upper.parent() {
             or_die(
                 fs::create_dir_all(parent),
@@ -458,7 +510,7 @@ fn enter(
             }
             let upper = env.upper(p);
             let work = under(&env.state().join("work"), p);
-            for d in [*p, &upper, &work] {
+            for d in [&upper, &work] {
                 fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
             }
             // ponytail: commas and colons in paths are not escaped in the overlay options (#6)
