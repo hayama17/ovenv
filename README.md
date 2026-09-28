@@ -127,6 +127,7 @@ This does not catch everything:
 - The record is taken when the session ends, not when a file is first written. Host changes during a session go unnoticed.
 - Directory contents are compared by metadata, not content.
 - xattrs are not recorded.
+- Entries under a staged directory ovenv couldn't read at session end (mode 000 or 444 in user mode) are recorded by the next `run` after it is made readable, so host changes in between go unnoticed.
 
 Regular files and symlinks are written to a temp file in the same directory and renamed into place,
 so an existing path never shows a half-written file or goes missing. If preparing the temp file fails, the original stays and the temp file is removed.
