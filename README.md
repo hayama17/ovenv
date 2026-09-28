@@ -61,6 +61,8 @@ ovenv run sh -c 'curl -fsSL https://example.com/install.sh | sh'
 - With `sudo`, the default staged paths are `/usr /opt /etc /var /root`.
 - Without it, ovenv uses a user namespace and stages `~/.local ~/.cargo ~/.npm ~/.cache ~/.config`. Commands still run as you.
 
+Both defaults also include `rw .`, so the project writes straight through.
+
 An `.ovenv/` sticks to the mode it was created in.
 
 ### Choosing paths
@@ -69,15 +71,18 @@ An `.ovenv/` sticks to the mode it was created in.
 
 ```
 ~
+rw .
 rw ~/.ssh
 rw ~/.gnupg
 ```
+
+Relative paths are relative to the project (the parent of `.ovenv/`), wherever you run ovenv from.
 
 `~` stages your whole home directory, so an installer appending to `~/.bashrc` shows up in `diff`.
 
 - Lines starting with `rw` are writable straight through to the host, even inside a staged path.
 - `/tmp`, `/dev` and `/proc` are always writable.
-- The project (the parent of `.ovenv/`) is writable, unless it is under a staged path; then it is staged too.
+- The project is treated like any other path: `rw .` writes through, leaving it out stages it if it is under a staged path and makes it read-only otherwise.
 - `.ovenv/` and the state directory are read-only inside a session.
 - Everything else is read-only.
 
