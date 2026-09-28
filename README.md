@@ -32,13 +32,20 @@ Requires Linux 5.11+, util-linux 2.39+, GNU tar, and `getfattr` (the `attr` pack
 ovenv init              create .ovenv/ in the current directory
 ovenv run <cmd>...      run a command with its writes staged
 ovenv shell             start $SHELL with writes staged
-ovenv diff              show staged changes
+ovenv diff [--content]  show staged changes (--content adds diff -u for MODIFY)
 ovenv apply [--force]   write staged changes to the host
 ovenv discard           throw staged changes away
 ```
 
 State lives in the nearest `.ovenv/` up from the current directory (created on first `run`).
 Add it to `.gitignore`.
+Only one `run`, `shell`, `apply` or `discard` can use an `.ovenv/` at a time; different `.ovenv/`s run in parallel.
+
+Run pipelines inside a shell, otherwise only the first command is staged:
+
+```sh
+ovenv run sh -c 'curl -fsSL https://example.com/install.sh | sh'
+```
 
 ### Root and user mode
 
@@ -65,20 +72,40 @@ Everything else is read-only.
 
 | Kind | Meaning |
 | --- | --- |
-| `ADD` | new file |
+| `ADD` | new file, symlink or directory |
 | `MODIFY` | content or symlink target changed |
-| `ATTR` | only mode or owner changed |
+| `ATTR` | only mode or owner changed (files and directories) |
 | `DELETE` | removed |
 | `REPLACE` | a directory was recreated, or a file and a directory swapped places |
+| `SKIP` | a change ovenv doesn't apply: xattrs (incl. ACLs and file capabilities), device/FIFO/socket files, symlink ownership |
 
-Files that were only touched are not listed.
+Directories end with `/`. Only listed changes are applied, and `SKIP` entries never are.
+Files that were only touched (mtime) are neither listed nor applied. Hard links are applied as separate files.
 Paths are shown after symlinks are resolved, so they point at what actually changes on disk
 (on Arch, `make install` into `/usr/local/share/man` shows up under `/usr/local/man`).
 
+`diff --content` compares against the host as it is now, not as it was when staging started.
+Binary files are reported as differing without printing their contents; symlinks show their targets.
+
 ### Apply
 
-`apply` refuses to run if a file it would overwrite changed on the host after staging started. Check them, then use `--force`.
-Apply is not atomic: if it fails halfway, some changes are already on the host.
+When a session ends, ovenv records the host state of every staged path: type, mode, owner, and the SHA-256 of files or the target of symlinks.
+For directories that are deleted or replaced, it also records a listing of their contents (names, types, modes, owners, sizes, mtimes).
+`apply` compares each change against that record and refuses if the host differs, including files deleted on the host. Check them, then use `--force`.
+
+This does not catch everything:
+
+- The record is taken when the session ends, not when a file is first written. Host changes during a session go unnoticed.
+- Directory contents are compared by metadata, not content.
+- xattrs are not recorded.
+
+Regular files and symlinks are written to a temp file in the same directory and renamed into place,
+so an existing path never shows a half-written file or goes missing. If preparing the temp file fails, the original stays and the temp file is removed.
+Because the rename creates a new inode, processes that already have the old file open keep reading the old content,
+and other hard links to the old file keep the old content.
+
+This is per file only. Apply as a whole is not atomic, nothing is fsynced, and deletions and directory replacements are plain `rm` and `mkdir`.
+If apply fails halfway, some changes are already on the host; staged changes are kept, so fix the cause and rerun it (with `--force` if it flags what it already applied).
 
 ## Limits
 
