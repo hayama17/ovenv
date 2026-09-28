@@ -194,6 +194,24 @@ ov run sh -c "echo new > $T/pc/sys/f; echo b > $T/pc/built"
 grep -qxF "MODIFY  $T/pc/sys/f" <<<"$(ov diff)" || fail "staged path inside the project not listed"
 ov discard
 
+# A staged path that doesn't exist yet is staged through its parent; ovenv creates nothing on the host.
+mkdir -p "$T/mis/.ovenv" "$T/sysm"
+printf '%s\n' "$T/sysm/new" "rw ." "rw $T/sysm/norw" >"$T/mis/.ovenv/paths"
+cd "$T/mis"
+err=$(ov run sh -c "mkdir -p $T/sysm/new/x; echo y > $T/sysm/new/x/f" 2>&1)
+grep -qF "$T/sysm/new doesn't exist; staging $T/sysm instead" <<<"$err" || fail "no notice for a missing staged path: $err"
+grep -qF "rw path $T/sysm/norw doesn't exist" <<<"$err" || fail "no warning for a missing rw path: $err"
+[[ ! -e $T/sysm/new && ! -e $T/sysm/norw ]] || fail "run created a path on the host"
+mkdir "$T/sysm/new"  # the host creates the path mid-session; what is staged must stay visible
+grep -qxF "ADD     $T/sysm/new/x/f" <<<"$(ov diff)" || fail "staged changes hidden after the host created the path"
+err=$(ov run true 2>&1)
+! grep -q "changed since staging started" <<<"$err" || fail "warned about .ovenv/paths although only the host changed"
+echo "$T/sysm/other" >>.ovenv/paths
+err=$(ov run true 2>&1)
+grep -q "changed since staging started" <<<"$err" || fail "no warning after editing .ovenv/paths: $err"
+ov discard
+[[ -d $T/sysm/new && ! -e $T/sysm/new/x ]] || fail "discard after a missing staged path"
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
