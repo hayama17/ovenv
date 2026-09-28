@@ -1182,7 +1182,7 @@ fn remove(p: &Path) -> io::Result<()> {
     }
 }
 
-fn apply(env: &Env, force: bool) {
+fn apply(env: &Env, force: bool, drop_skipped: bool) {
     let _lock = lock(env);
     if env.state.is_none() {
         println!("nothing staged");
@@ -1217,6 +1217,15 @@ fn apply(env: &Env, force: bool) {
             eprintln!("  {c}");
         }
         die!("review them, then rerun with --force");
+    }
+    // A SKIP entry's staged copy is its only copy, so dropping it has to be asked for.
+    let unsupported: Vec<_> = list.iter().filter(|c| c.kind == Kind::Skip).collect();
+    if !unsupported.is_empty() && !drop_skipped {
+        eprintln!("ovenv: these staged changes can't be applied:");
+        for c in &unsupported {
+            eprintln!("  {} ({})", c.host.display(), c.note);
+        }
+        die!("nothing was changed; rerun with --drop-skipped to apply the rest and discard these");
     }
 
     let mut dirmodes = Vec::new();
@@ -1327,7 +1336,8 @@ const USAGE: &str = "usage: ovenv <command>
   run <cmd>...      run a command with its writes staged
   shell             start $SHELL with writes staged
   diff [--content]  show staged changes (--content adds diff -u for modified files)
-  apply [--force]   write staged changes to the host
+  apply [--force] [--drop-skipped]
+                    write staged changes to the host
   discard           throw staged changes away
 
 Run with sudo to stage writes to system paths (/usr, /etc, ...).";
@@ -1358,8 +1368,15 @@ fn main() {
             show_diff(&Env::load(false), content)
         }
         "apply" => {
-            let force = flag("--force");
-            apply(&Env::load(false), force)
+            let (mut force, mut drop_skipped) = (false, false);
+            for a in &args[1..] {
+                match a.to_str() {
+                    Some("--force") => force = true,
+                    Some("--drop-skipped") => drop_skipped = true,
+                    _ => usage_error(),
+                }
+            }
+            apply(&Env::load(false), force, drop_skipped)
         }
         "discard" => {
             let env = Env::load(true);
