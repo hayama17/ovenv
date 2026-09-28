@@ -49,6 +49,8 @@ Keeping staged changes in `/tmp` lets you stage the directory `.ovenv/` lives in
 They don't survive a reboot: if the state directory is gone, `diff`, `apply` and `run` stop with an error, and `discard` resets.
 `apply` and `discard` remove the state directory and keep `.ovenv/paths`.
 Only one `run`, `shell`, `apply` or `discard` can use an `.ovenv/` at a time; different `.ovenv/`s run in parallel.
+A process a session left running in the background (a daemon, `cmd &`) keeps the session alive:
+`run`, `apply` and `discard` refuse, naming its PIDs, until it exits.
 
 Run pipelines inside a shell, otherwise only the first command is staged:
 

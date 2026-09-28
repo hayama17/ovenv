@@ -212,6 +212,17 @@ grep -q "changed since staging started" <<<"$err" || fail "no warning after edit
 ov discard
 [[ -d $T/sysm/new && ! -e $T/sysm/new/x ]] || fail "discard after a missing staged path"
 
+# A process left running by a session blocks run, apply and discard until it exits.
+mkdir -p "$T/bg/.ovenv" "$T/sysb"; echo "$T/sysb" >"$T/bg/.ovenv/paths"
+cd "$T/bg"
+ov run sh -c "echo x > $T/sysb/f; sleep 3 >/dev/null 2>&1 &"
+err=$(ov apply 2>&1) && fail "apply ran while a session process was alive"
+grep -q "still running" <<<"$err" || fail "unclear leftover-process error: $err"
+! ov discard 2>/dev/null || fail "discard ran while a session process was alive"
+! ov run true 2>/dev/null || fail "run started while a session process was alive"
+for _ in $(seq 20); do ov apply >/dev/null 2>&1 && break; sleep 0.5; done
+[[ $(cat "$T/sysb/f") == x ]] || fail "apply did not go through after the process exited"
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
