@@ -1045,11 +1045,13 @@ fn put(env: &Env, up: &Path, h: &Path) -> Result<(), String> {
     let tmp = loop {
         let tmp = dir.join(format!(".ovenv.{}", random_suffix()));
         let made = if um.file_type().is_symlink() {
-            fs::read_link(up).and_then(|t| symlink(t, &tmp)).and_then(|()| {
-                copy_xattrs(up, &tmp).inspect_err(|_| {
-                    let _ = fs::remove_file(&tmp);
+            fs::read_link(up)
+                .and_then(|t| symlink(t, &tmp))
+                .and_then(|()| {
+                    copy_xattrs(up, &tmp).inspect_err(|_| {
+                        let _ = fs::remove_file(&tmp);
+                    })
                 })
-            })
         } else {
             (|| {
                 let mut f = OpenOptions::new()
