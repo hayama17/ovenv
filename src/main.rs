@@ -732,6 +732,14 @@ fn walk(root: &Path, unreadable: &mut Vec<PathBuf>) -> Vec<PathBuf> {
         };
         let mut names: Vec<OsString> = rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         names.sort();
+        // A dir that lists but can't be entered (e.g. mode 444) is just as unreadable.
+        if names
+            .iter()
+            .any(|n| lstat(&root.join(rel).join(n)).is_none())
+        {
+            bad.push(rel.to_path_buf());
+            return;
+        }
         for n in names {
             let r = rel.join(&n);
             out.push(r.clone());
@@ -1268,6 +1276,16 @@ fn apply(env: &Env, force: bool, drop_skipped: bool) {
             eprintln!("  {} ({})", c.host.display(), c.note);
         }
         die!("nothing was changed; rerun with --drop-skipped to apply the rest and discard these");
+    }
+    // Everything apply will copy must be readable up front, or it would stop halfway with the host half-changed.
+    for c in &list {
+        let copies = matches!(c.kind, Kind::Add | Kind::Modify | Kind::Replace);
+        if copies && lstat(&c.up).is_some_and(|m| m.is_file()) && File::open(&c.up).is_err() {
+            die!(
+                "cannot read staged {}; nothing was changed. Make it readable in `ovenv run`, or `ovenv discard`",
+                c.host.display()
+            );
+        }
     }
 
     let mut dirmodes = Vec::new();

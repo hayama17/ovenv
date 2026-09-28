@@ -162,6 +162,20 @@ if [[ $EUID -ne 0 ]]; then
   ov run chmod 000 "$T/sys6/locked" 2>/dev/null
   ov discard || fail "discard failed on an unreadable staged directory"
   [[ ! -e .ovenv/state ]] || fail "discard left the state behind"
+
+  # A dir that lists but can't be entered hides its files just the same.
+  ov run sh -c "mkdir $T/sys6/rd; echo important > $T/sys6/rd/f; chmod 444 $T/sys6/rd" 2>/dev/null
+  err=$(ov diff 2>&1) && fail "diff ignored a non-traversable staged directory"
+  grep -qF "cannot read staged directory $T/sys6/rd" <<<"$err" || fail "unclear error for mode 444: $err"
+  ov discard
+
+  # An unreadable staged file stops apply before anything reaches the host.
+  echo old >"$T/sys6/a"
+  ov run sh -c "echo new > $T/sys6/a; echo secret > $T/sys6/z; chmod 000 $T/sys6/z"
+  err=$(ov apply 2>&1) && fail "apply went ahead with an unreadable staged file"
+  grep -qF "cannot read staged $T/sys6/z" <<<"$err" || fail "unclear unreadable file error: $err"
+  [[ $(cat "$T/sys6/a") == old && ! -e $T/sys6/z ]] || fail "apply changed the host before failing"
+  ov discard
 fi
 
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
