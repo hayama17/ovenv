@@ -155,6 +155,45 @@ grep -qxF "  $T/sys4" <<<"$err" || fail "deleted staged directory not reported: 
 [[ -d $(cat .ovenv/state) ]] || fail "refused apply dropped the staged state"
 ov discard
 
+# An unreadable staged directory stops diff and apply instead of hiding what is inside it (root reads it anyway).
+if [[ $EUID -ne 0 ]]; then
+  mkdir -p "$T/lockp/.ovenv" "$T/sys6"; echo "$T/sys6" >"$T/lockp/.ovenv/paths"
+  cd "$T/lockp"
+  ov run sh -c "mkdir $T/sys6/locked; echo important > $T/sys6/locked/f; chmod 000 $T/sys6/locked" 2>/dev/null
+  err=$(ov diff 2>&1) && fail "diff ignored an unreadable staged directory"
+  grep -qF "cannot read staged directory $T/sys6/locked" <<<"$err" || fail "unclear unreadable error: $err"
+  ! ov apply 2>/dev/null || fail "apply ignored an unreadable staged directory"
+  [[ ! -e $T/sys6/locked ]] || fail "refused apply changed the host"
+  ov run chmod 700 "$T/sys6/locked"
+  grep -qxF "ADD     $T/sys6/locked/f" <<<"$(ov diff)" || fail "file in a formerly unreadable dir not listed"
+  ov run chmod 000 "$T/sys6/locked" 2>/dev/null
+  ov discard || fail "discard failed on an unreadable staged directory"
+  [[ ! -e .ovenv/state ]] || fail "discard left the state behind"
+
+  # A dir that lists but can't be entered hides its files just the same.
+  ov run sh -c "mkdir $T/sys6/rd; echo important > $T/sys6/rd/f; chmod 444 $T/sys6/rd" 2>/dev/null
+  err=$(ov diff 2>&1) && fail "diff ignored a non-traversable staged directory"
+  grep -qF "cannot read staged directory $T/sys6/rd" <<<"$err" || fail "unclear error for mode 444: $err"
+  ov discard
+
+  # An unreadable staged file stops apply before anything reaches the host.
+  echo old >"$T/sys6/a"
+  ov run sh -c "echo new > $T/sys6/a; echo secret > $T/sys6/z; chmod 000 $T/sys6/z"
+  err=$(ov apply 2>&1) && fail "apply went ahead with an unreadable staged file"
+  grep -qF "cannot read staged $T/sys6/z" <<<"$err" || fail "unclear unreadable file error: $err"
+  [[ $(cat "$T/sys6/a") == old && ! -e $T/sys6/z ]] || fail "apply changed the host before failing"
+  ov discard
+fi
+
+# A staged path inside the project is staged, although the rest of the project writes through.
+mkdir -p "$T/pc/.ovenv" "$T/pc/sys"; echo old >"$T/pc/sys/f"
+echo "$T/pc/sys" >"$T/pc/.ovenv/paths"
+cd "$T/pc"
+ov run sh -c "echo new > $T/pc/sys/f; echo b > $T/pc/built"
+[[ $(cat "$T/pc/sys/f") == old && -e $T/pc/built ]] || fail "staged path inside the project wrote through"
+grep -qxF "MODIFY  $T/pc/sys/f" <<<"$(ov diff)" || fail "staged path inside the project not listed"
+ov discard
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
