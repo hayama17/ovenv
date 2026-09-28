@@ -25,8 +25,10 @@ echo old >xkeep; echo x >xattr-mode; chmod 644 xattr-mode
 setfattr -n user.ovenv_keep -v 1 xkeep; setfattr -n user.ovenv_keep -v 1 xattr-mode
 cd "$T/proj"
 
+chmod 755 "$S"
 ov run sh -c "
   set -e; cd $S
+  chmod 750 $S
   echo new > conf; echo new > conf2; echo staged > hostgone; rm gone
   echo hi > bin/tool; touch touched; chmod 600 mode
   rm -rf d; mkdir d; echo n > d/new
@@ -57,7 +59,7 @@ for want in "ADD     $S/bin/tool" "MODIFY  $S/conf" "DELETE  $S/gone" "ATTR    $
             "REPLACE $S/d/" "ADD     $S/d/new" "ADD     $S/emptydir/" "ATTR    $S/pd/" \
             "DELETE  $S/deldir/" "REPLACE $S/d2f" "REPLACE $S/f2d/" "ADD     $S/f2d/in" \
             "MODIFY  $S/link" "MODIFY  $S/bin.dat" "SKIP    $S/xa  (xattrs, not applied)" \
-            "MODIFY  $S/xkeep" "ATTR    $S/xattr-mode"; do
+            "MODIFY  $S/xkeep" "ATTR    $S/xattr-mode" "ATTR    $S/"; do
   grep -qxF -- "$want" <<<"$out" || fail "missing: $want"
 done
 ! grep -q touched <<<"$out" || fail "touch-only file reported"
@@ -102,6 +104,7 @@ ov apply --force
 [[ $(stat -c %a "$S/mode") == 600 && $(cat "$S/mode") == keep && $(stat -c %i "$S/mode") == "$ino_mode" ]] || fail "ATTR rewrote the file"
 [[ -e $S/d/new && ! -e $S/d/old && -d $S/emptydir && ! -e $S/deldir ]] || fail "apply dirs"
 [[ $(stat -c %a "$S/pd") == 700 && -e $S/pd/f ]] || fail "dir ATTR"
+[[ $(stat -c %a "$S") == 750 ]] || fail "ATTR on the overlay root not applied"
 [[ -f $S/d2f && $(cat "$S/d2f") == file && -f $S/f2d/in ]] || fail "type changes"
 [[ $(readlink "$S/link") == b && $(tail -c3 "$S/bin.dat") == new ]] || fail "symlink/binary"
 [[ $(stat -c %Y "$S/touched") == "$mt" ]] || fail "touch-only file was applied"
@@ -111,18 +114,41 @@ ov apply --force
 [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left"
 [[ ! -e $ST && ! -e $T/proj/.ovenv/state && -f $T/proj/.ovenv/paths && -z $(ov diff) ]] || fail "not discarded after apply"
 
+# A path under another staged path is covered by it, whatever the order, and leaves the parent's attributes alone.
+mkdir -p "$T/ovl/.ovenv" "$T/sys5/sub"; chmod 700 "$T/sys5"
+printf '%s\n' "$T/sys5/sub" "$T/sys5" >"$T/ovl/.ovenv/paths"
+cd "$T/ovl"
+ov run sh -c "echo x > $T/sys5/sub/f"
+out=$(ov diff)
+[[ $(head -n1 <<<"$out") == "ADD     $T/sys5/sub/f" && $(grep -c . <<<"$out") == 2 ]] || fail "overlapping paths: $out"
+ov apply >/dev/null
+[[ $(stat -c %a "$T/sys5") == 700 && -f $T/sys5/sub/f ]] || fail "overlapping paths changed the parent"
+
+# A staged directory deleted on the host is a conflict, and the staged state survives the refusal.
+mkdir -p "$T/rootgone/.ovenv" "$T/sys4"; chmod 755 "$T/sys4"
+echo "$T/sys4" >"$T/rootgone/.ovenv/paths"
+cd "$T/rootgone"
+ov run chmod 700 "$T/sys4"
+rmdir "$T/sys4"
+err=$(ov apply 2>&1) && fail "apply ignored a deleted staged directory"
+grep -qxF "  $T/sys4" <<<"$err" || fail "deleted staged directory not reported: $err"
+[[ -d $(cat .ovenv/state) ]] || fail "refused apply dropped the staged state"
+ov discard
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
-mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"
+mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
 printf '%s\n' '~' "rw $H/direct" >"$H/proj/.ovenv/paths"
 cd "$H/proj"
 export HOME=$H
-ov run sh -c "echo added >> ~/.bashrc; echo b > $H/proj/built; echo d > $H/direct/d"
+ov run sh -c "echo added >> ~/.bashrc; echo b > $H/proj/built; echo d > $H/direct/d; stat -c %a ~ > $H/direct/mode"
+[[ $(cat "$H/direct/mode") == 700 ]] || fail "staged ~ looked like mode $(cat "$H/direct/mode") inside"
 [[ $(cat "$H/.bashrc") == orig && ! -e $H/proj/built && -e $H/direct/d ]] || fail "home staging"
 out=$(ov diff)
 grep -qxF "MODIFY  $H/.bashrc" <<<"$out" || fail "dotfile not staged: $out"
 grep -qxF "ADD     $H/proj/built" <<<"$out" || fail "project under ~ not staged: $out"
 ! grep -q direct <<<"$out" || fail "rw path was staged"
+! grep -qF "ATTR    $H/" <<<"$out" || fail "mounting the overlay reported a root change"
 
 chmod 755 "$(cat .ovenv/state)"
 err=$(ov diff 2>&1) && fail "used a state dir with mode 755"
