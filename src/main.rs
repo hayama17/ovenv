@@ -33,13 +33,17 @@ enum Mode {
 }
 
 struct Env {
+    /// .ovenv/: paths, mode, lock and the pointer to the state directory
     dir: PathBuf,
     project: PathBuf,
     mode: Mode,
+    /// /tmp/ovenv-*/: upper, work and base
+    state: Option<PathBuf>,
 }
 
 impl Env {
-    fn load() -> Env {
+    /// `allow_gone` lets discard clean up after the state directory vanished (e.g. a reboot).
+    fn load(allow_gone: bool) -> Env {
         let dir = match std::env::var_os("OVENV_DIR") {
             Some(d) => resolve(Path::new(&d)),
             None => find_dir(),
@@ -66,11 +70,33 @@ impl Env {
                 dir.display()
             );
         }
-        Env { dir, project, mode }
+        let state = fs::read_to_string(dir.join("state"))
+            .ok()
+            .map(|s| PathBuf::from(s.trim_end_matches('\n')));
+        if let Some(st) = &state {
+            if lstat(st).is_some() {
+                check_state(st);
+            } else if !allow_gone {
+                die!(
+                    "staged changes in {} are gone (e.g. after a reboot); run `ovenv discard` to start over",
+                    st.display()
+                );
+            }
+        }
+        Env {
+            dir,
+            project,
+            mode,
+            state,
+        }
+    }
+
+    fn state(&self) -> &Path {
+        self.state.as_deref().expect("state directory not set")
     }
 
     fn upper(&self, p: &Path) -> PathBuf {
-        under(&self.dir.join("upper"), p)
+        under(&self.state().join("upper"), p)
     }
 
     fn opaque_xattr(&self) -> &'static str {
@@ -124,6 +150,42 @@ impl Env {
             .map(|(_, p)| p)
             .collect()
     }
+}
+
+/// The state directory holds staged file contents, so refuse anything we didn't create for ourselves.
+fn check_state(st: &Path) {
+    let m = lstat(st);
+    let ok = st.parent() == Some(Path::new("/tmp"))
+        && st
+            .file_name()
+            .is_some_and(|n| n.as_bytes().starts_with(b"ovenv-"))
+        && m.as_ref().is_some_and(|m| {
+            m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0
+        });
+    if !ok {
+        die!(
+            "refusing to use {}: expected a /tmp/ovenv-* directory owned by you with mode 700",
+            st.display()
+        );
+    }
+}
+
+fn create_state(env: &mut Env) {
+    let mut tmpl = b"/tmp/ovenv-XXXXXXXX\0".to_vec();
+    // mkdtemp picks an unguessable name and creates it with mode 700
+    if unsafe { libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) }.is_null() {
+        die!(
+            "cannot create a state directory in /tmp: {}",
+            io::Error::last_os_error()
+        );
+    }
+    tmpl.pop();
+    let st = PathBuf::from(OsStr::from_bytes(&tmpl));
+    or_die(
+        fs::write(env.dir.join("state"), format!("{}\n", st.display())),
+        "cannot write .ovenv/state",
+    );
+    env.state = Some(st);
 }
 
 fn find_dir() -> PathBuf {
@@ -212,8 +274,12 @@ fn lock(env: &Env) -> File {
 
 // ---------------------------------------------------------------- run
 
-fn run(env: &Env, cmd: Vec<OsString>) -> ! {
-    let _lock = lock(env);
+fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
+    let _lock = lock(&env);
+    if env.state.is_none() {
+        create_state(&mut env);
+    }
+    let env = &env;
     let mode_file = env.dir.join("mode");
     if !mode_file.exists() {
         let m = if env.mode == Mode::Root {
@@ -227,17 +293,17 @@ fn run(env: &Env, cmd: Vec<OsString>) -> ! {
     let gid = unsafe { libc::getgid() };
 
     let mut ov = Vec::new();
-    let mut rw = vec![env.project.clone(), PathBuf::from("/tmp")];
+    let mut rw = vec![PathBuf::from("/tmp")];
     for (is_rw, p) in env.paths() {
         if is_rw {
             rw.push(p);
             continue;
         }
-        if env.dir.starts_with(&p) {
+        if env.state().starts_with(&p) {
             die!(
-                "{} is inside overlay path {}",
-                env.dir.display(),
-                p.display()
+                "cannot stage {}: ovenv keeps staged changes in {}",
+                p.display(),
+                env.state().display()
             );
         }
         if env.mode == Mode::User {
@@ -249,6 +315,10 @@ fn run(env: &Env, cmd: Vec<OsString>) -> ! {
             }
         }
         ov.push(p);
+    }
+    // A project under a staged path is staged too; otherwise it stays writable as before.
+    if !ov.iter().any(|p| env.project.starts_with(p)) {
+        rw.insert(0, env.project.clone());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
 
@@ -314,6 +384,14 @@ fn enter(
             None,
         )?;
 
+        // Grab the host's view of rw paths now, before an overlay above them would hide it.
+        let mut clones = Vec::new();
+        for p in rw {
+            if fs::symlink_metadata(p).is_ok() {
+                clones.push((open_tree(p)?, p));
+            }
+        }
+
         // Overlay needs a writable upper at mount time, so mount before making everything read-only.
         let xopt = if env.mode == Mode::User {
             ",userxattr"
@@ -322,11 +400,11 @@ fn enter(
         };
         for p in ov {
             let upper = env.upper(p);
-            let work = under(&env.dir.join("work"), p);
+            let work = under(&env.state().join("work"), p);
             for d in [p, &upper, &work] {
                 fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
             }
-            // ponytail: commas and colons in paths are not escaped in the overlay options
+            // ponytail: commas and colons in paths are not escaped in the overlay options (#6)
             let opts = format!(
                 "lowerdir={},upperdir={},workdir={}{xopt}",
                 p.display(),
@@ -342,11 +420,14 @@ fn enter(
         for p in ov {
             set_readonly(p, false, false)?;
         }
-        for p in rw {
-            if fs::symlink_metadata(p).is_ok() {
-                mount(Some(&p.to_string_lossy()), p, None, libc::MS_BIND, None)?;
-                set_readonly(p, false, false)?;
-            }
+        for (fd, p) in &clones {
+            move_mount(fd, p)?;
+            set_readonly(p, false, false)?;
+        }
+        // The command may read ovenv's own bookkeeping but must not change it.
+        for p in [&env.dir, env.state()] {
+            mount(Some(&p.to_string_lossy()), p, None, libc::MS_BIND, None)?;
+            set_readonly(p, true, false)?;
         }
 
         // Re-resolve cwd, otherwise it still points below the new mounts.
@@ -400,6 +481,46 @@ fn mount(
         },
         format!("mount {}", target.display()),
     )
+}
+
+/// A detached copy of the mount at `p` (like `mount --bind`), to attach later with move_mount.
+fn open_tree(p: &Path) -> Result<File, String> {
+    const SYS_OPEN_TREE: libc::c_long = 428;
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    let c = cstr(p);
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPEN_TREE,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open_tree {}: {}",
+            p.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(fd as libc::c_int) })
+}
+
+fn move_mount(fd: &File, target: &Path) -> Result<(), String> {
+    const SYS_MOVE_MOUNT: libc::c_long = 429;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    let c = cstr(target);
+    let r = unsafe {
+        libc::syscall(
+            SYS_MOVE_MOUNT,
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    check(r as libc::c_int, format!("move_mount {}", target.display()))
 }
 
 #[repr(C)]
@@ -646,7 +767,10 @@ fn host_state(env: &Env, h: &Path, up: &Path) -> String {
 // ---------------------------------------------------------------- baseline
 
 fn read_base(env: &Env) -> HashMap<PathBuf, String> {
-    let data = fs::read(env.dir.join("base")).unwrap_or_default();
+    let Some(st) = &env.state else {
+        return HashMap::new();
+    };
+    let data = fs::read(st.join("base")).unwrap_or_default();
     let mut fields = data.split(|&b| b == 0);
     let mut out = HashMap::new();
     while let (Some(p), Some(s)) = (fields.next(), fields.next()) {
@@ -680,7 +804,7 @@ fn record_base(env: &Env) {
     let f = OpenOptions::new()
         .append(true)
         .create(true)
-        .open(env.dir.join("base"));
+        .open(env.state().join("base"));
     or_die(
         f.and_then(|mut f| f.write_all(&buf)),
         "cannot record the host state",
@@ -722,6 +846,9 @@ struct Change {
 /// Every real change, in apply order. diff, the conflict check and apply all use this.
 fn changes(env: &Env) -> Vec<Change> {
     let mut out = Vec::new();
+    if env.state.is_none() {
+        return out;
+    }
     for p in env.overlays() {
         let u = env.upper(&p);
         // directories whose host contents go away / whose staged contents are skipped
@@ -852,9 +979,9 @@ fn show_diff(env: &Env, content: bool) {
         }
         let _ = writeln!(out);
     }
-    let staged: u64 = walk(&env.dir.join("upper"))
+    let staged: u64 = walk(&env.state().join("upper"))
         .iter()
-        .filter_map(|r| lstat(&env.dir.join("upper").join(r)))
+        .filter_map(|r| lstat(&env.state().join("upper").join(r)))
         .map(|m| m.blocks() * 512)
         .sum();
     let _ = writeln!(out, "\n{} staged", human(staged));
@@ -967,6 +1094,10 @@ fn remove(p: &Path) -> io::Result<()> {
 
 fn apply(env: &Env, force: bool) {
     let _lock = lock(env);
+    if env.state.is_none() {
+        println!("nothing staged");
+        return;
+    }
     let list = changes(env);
     let base = read_base(env);
     let mut conflicts = Vec::new();
@@ -1053,16 +1184,20 @@ fn apply(env: &Env, force: bool) {
 
 // ---------------------------------------------------------------- discard / init
 
+/// Remove the staged state; .ovenv/paths stays.
 fn discard_files(env: &Env) {
-    // overlay leaves a mode-000 dir in workdir, which blocks removal for non-root
-    let work = env.dir.join("work");
-    for rel in std::iter::once(PathBuf::new()).chain(walk(&work)) {
-        let p = work.join(rel);
-        if is_dir(&p) {
-            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+    if let Some(st) = env.state.as_ref().filter(|st| lstat(st).is_some()) {
+        // overlay leaves a mode-000 dir in workdir, which blocks removal for non-root
+        let work = st.join("work");
+        for rel in std::iter::once(PathBuf::new()).chain(walk(&work)) {
+            let p = work.join(rel);
+            if is_dir(&p) {
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
         }
+        or_die(remove(st), format!("cannot remove {}", st.display()));
     }
-    for name in ["upper", "work", "base", "mode"] {
+    for name in ["state", "mode"] {
         let p = env.dir.join(name);
         or_die(remove(&p), format!("cannot remove {}", p.display()));
     }
@@ -1082,7 +1217,9 @@ fn init() {
     let text = format!(
         "# One path per line. Writes under these paths are staged in OverlayFS.\n\
          # Prefix with 'rw ' to let writes go straight to the host.\n\
-         # Everything else is read-only inside ovenv, except this project, /tmp, /dev and /proc.\n{}\n",
+         # Use ~ to stage your whole home directory, dotfiles included.\n\
+         # Everything else is read-only inside ovenv, except /tmp, /dev, /proc\n\
+         # and this project (unless it is under a staged path).\n{}\n",
         defaults.join("\n")
     );
     or_die(
@@ -1118,22 +1255,22 @@ fn main() {
     };
     match cmd {
         "init" => init(),
-        "run" if args.len() > 1 => run(&Env::load(), args[1..].to_vec()),
+        "run" if args.len() > 1 => run(Env::load(false), args[1..].to_vec()),
         "run" => die!("usage: ovenv run <cmd>..."),
         "shell" => run(
-            &Env::load(),
+            Env::load(false),
             vec![std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into())],
         ),
         "diff" => {
             let content = flag("--content");
-            show_diff(&Env::load(), content)
+            show_diff(&Env::load(false), content)
         }
         "apply" => {
             let force = flag("--force");
-            apply(&Env::load(), force)
+            apply(&Env::load(false), force)
         }
         "discard" => {
-            let env = Env::load();
+            let env = Env::load(true);
             let _lock = lock(&env);
             discard_files(&env);
         }

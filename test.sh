@@ -3,11 +3,14 @@
 set -euo pipefail
 OVENV=$(realpath "${OVENV_BIN:-$(dirname "$0")/target/release/ovenv}")
 T=$(mktemp -d "$HOME/.ovenv-test.XXXXXX")
-trap 'chmod -R u+rwx "$T"; rm -rf "$T"' EXIT
+cleanup() {
+  cat "$T"/*/.ovenv/state "$T"/*/*/.ovenv/state 2>/dev/null | while read -r st; do chmod -R u+rwx "$st"; rm -rf "$st"; done || true
+  chmod -R u+rwx "$T"; rm -rf "$T"
+}
+trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ov() { "$OVENV" "$@"; }
 S=$T/sys
-U=$T/proj/.ovenv/upper$S
 
 mkdir -p "$T"/{proj/.ovenv,proj2/.ovenv,sys2,out,share} "$S"/{bin,d,pd,deldir,d2f}
 printf '%s\n' "$S" "rw $T/share" >"$T/proj/.ovenv/paths"
@@ -31,7 +34,13 @@ ov run sh -c "
   echo x > xa; setfattr -n user.ovenv_test -v 1 xa
   touch $T/out/x 2>/dev/null && echo leak > $T/proj/leak || true
   echo b > $T/proj/built; echo s > $T/share/s; id -u > $T/proj/uid
+  touch $T/proj/.ovenv/x 2>/dev/null && echo leak > $T/proj/ovenv-writable || true
+  touch \"\$(cat $T/proj/.ovenv/state)/x\" 2>/dev/null && echo leak > $T/proj/state-writable || true
 "
+ST=$(cat "$T/proj/.ovenv/state")
+U=$ST/upper$S
+[[ $ST == /tmp/ovenv-* && $(stat -c %a:%u "$ST") == "700:$(id -u)" ]] || fail "state dir: $ST $(stat -c %a:%u "$ST")"
+[[ ! -e $T/proj/ovenv-writable && ! -e $T/proj/state-writable ]] || fail ".ovenv or the state dir was writable inside"
 
 [[ $(cat "$S/conf") == old && ! -e $S/bin/tool && -e $S/gone && -e $S/d/old ]] || fail "host changed"
 [[ ! -e $S/emptydir && -f $S/f2d && -d $S/d2f && $(stat -c %a "$S/pd") == 755 ]] || fail "host changed"
@@ -63,7 +72,7 @@ ov run sleep 2 & sleep 0.5
 ! ov apply 2>/dev/null || fail "apply allowed during a run"
 err=$(ov discard 2>&1) && fail "discard allowed during a run"
 grep -q "in use" <<<"$err" || fail "unclear lock error: $err"
-(cd "$T/proj2" && ov run true) || fail "a different .ovenv was blocked"
+(cd "$T/proj2" && ov run true && ov discard) || fail "a different .ovenv was blocked"
 wait
 
 # Same-second content change and a deletion on the host, both after staging.
@@ -94,5 +103,32 @@ ov apply --force
 [[ $(stat -c %Y "$S/touched") == "$mt" ]] || fail "touch-only file was applied"
 [[ ! -e $S/xa ]] || fail "skipped entry was applied"
 [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left"
-[[ ! -d $T/proj/.ovenv/upper && -z $(ov diff) ]] || fail "not discarded after apply"
+[[ ! -e $ST && ! -e $T/proj/.ovenv/state && -f $T/proj/.ovenv/paths && -z $(ov diff) ]] || fail "not discarded after apply"
+
+# Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
+H=$T/home
+mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"
+printf '%s\n' '~' "rw $H/direct" >"$H/proj/.ovenv/paths"
+cd "$H/proj"
+export HOME=$H
+ov run sh -c "echo added >> ~/.bashrc; echo b > $H/proj/built; echo d > $H/direct/d"
+[[ $(cat "$H/.bashrc") == orig && ! -e $H/proj/built && -e $H/direct/d ]] || fail "home staging"
+out=$(ov diff)
+grep -qxF "MODIFY  $H/.bashrc" <<<"$out" || fail "dotfile not staged: $out"
+grep -qxF "ADD     $H/proj/built" <<<"$out" || fail "project under ~ not staged: $out"
+! grep -q direct <<<"$out" || fail "rw path was staged"
+
+chmod 755 "$(cat .ovenv/state)"
+err=$(ov diff 2>&1) && fail "used a state dir with mode 755"
+grep -q "refusing to use" <<<"$err" || fail "unclear state check error: $err"
+chmod 700 "$(cat .ovenv/state)"
+
+st=$(cat .ovenv/state); chmod -R u+rwx "$st"; rm -rf "$st"
+for c in diff apply "run true"; do
+  # shellcheck disable=SC2086
+  err=$(ov $c 2>&1) && fail "$c ignored a missing state dir"
+  grep -q "are gone" <<<"$err" || fail "$c: unclear missing-state error: $err"
+done
+ov discard
+[[ ! -e .ovenv/state && -f .ovenv/paths && -z $(ov diff) ]] || fail "discard after a missing state dir"
 echo OK

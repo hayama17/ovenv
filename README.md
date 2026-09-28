@@ -14,7 +14,7 @@ $ sudo ovenv apply      # or: sudo ovenv discard
 ```
 
 ovenv runs the command in a private mount namespace where selected paths are covered by OverlayFS.
-Writes land in `.ovenv/upper/` instead of the host, so the upper layer *is* the list of changes.
+Writes land in an upper layer instead of the host, so the upper layer *is* the list of changes.
 Everything else is mounted read-only, so a write outside the staged paths fails with `EROFS` instead of silently reaching the host.
 
 ## Install
@@ -37,8 +37,16 @@ ovenv apply [--force]   write staged changes to the host
 ovenv discard           throw staged changes away
 ```
 
-State lives in the nearest `.ovenv/` up from the current directory (created on first `run`).
-Add it to `.gitignore`.
+ovenv uses the nearest `.ovenv/` up from the current directory (created on first `run`). Add it to `.gitignore`.
+
+| Where | What |
+| --- | --- |
+| `.ovenv/` | `paths`, the mode, a lock, and `state` pointing at the state directory |
+| `/tmp/ovenv-<random>/` | staged changes (upper and work layers) and the recorded host state; mode 700 |
+
+Keeping staged changes in `/tmp` lets you stage the directory `.ovenv/` lives in, including all of `~`.
+They don't survive a reboot: if the state directory is gone, `diff`, `apply` and `run` stop with an error, and `discard` resets.
+`apply` and `discard` remove the state directory and keep `.ovenv/paths`.
 Only one `run`, `shell`, `apply` or `discard` can use an `.ovenv/` at a time; different `.ovenv/`s run in parallel.
 
 Run pipelines inside a shell, otherwise only the first command is staged:
@@ -59,14 +67,21 @@ An `.ovenv/` sticks to the mode it was created in.
 `.ovenv/paths` holds one path per line:
 
 ```
-/usr/local
-~/.cargo
+~
 rw ~/.ssh
+rw ~/.gnupg
 ```
 
-Lines starting with `rw` are writable straight through to the host.
-The project directory (the parent of `.ovenv/`), `/tmp`, `/dev` and `/proc` are always writable.
-Everything else is read-only.
+`~` stages your whole home directory, so an installer appending to `~/.bashrc` shows up in `diff`.
+
+- Lines starting with `rw` are writable straight through to the host, even inside a staged path.
+- `/tmp`, `/dev` and `/proc` are always writable.
+- The project (the parent of `.ovenv/`) is writable, unless it is under a staged path; then it is staged too.
+- `.ovenv/` and the state directory are read-only inside a session.
+- Everything else is read-only.
+
+Unix sockets can't be reached through an overlay, so pass through directories that hold them (`rw ~/.gnupg` for gpg-agent).
+`/tmp` and `/` can't be staged, since the state directory lives in `/tmp`.
 
 ### Diff kinds
 
@@ -111,7 +126,7 @@ If apply fails halfway, some changes are already on the host; staged changes are
 
 - **Not a sandbox.** Network, processes and IPC are shared with the host. Don't use it to contain malicious code.
 - **Only processes started by ovenv see the staged view.** Daemons, systemd services and your editor see the host.
-- **Unix sockets can't be reached through an overlay.** That's why `/tmp` is passed through.
+- **Unix sockets can't be reached through an overlay.** That's why `/tmp` is passed through; pass through other socket directories with `rw`.
 - **Package managers are not supported.** Applying part of a package database breaks it.
 - **Don't change the host under a running session.** OverlayFS doesn't support changes to the lower layer while mounted.
 - User mode can't stage paths owned by other users.
