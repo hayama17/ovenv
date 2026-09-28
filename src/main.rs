@@ -320,6 +320,38 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
     if !ov.iter().any(|p| env.project.starts_with(p)) {
         rw.insert(0, env.project.clone());
     }
+    // The merged root takes its mode, owner and xattrs from the upper dir, so start it as a copy of the host dir.
+    for p in &ov {
+        let upper = env.upper(p);
+        if lstat(&upper).is_some() {
+            continue;
+        }
+        or_die(
+            fs::create_dir_all(p),
+            format!("cannot create {}", p.display()),
+        );
+        if let Some(parent) = upper.parent() {
+            or_die(
+                fs::create_dir_all(parent),
+                "cannot create the state directory",
+            );
+        }
+        let hm = lstat(p).unwrap_or_else(|| die!("{} vanished", p.display()));
+        or_die(
+            fs::DirBuilder::new().mode(0o700).create(&upper),
+            "cannot create the upper directory",
+        );
+        or_die(
+            own(env, &hm, &upper),
+            "cannot set the upper directory's owner",
+        );
+        or_die(
+            fs::set_permissions(&upper, fs::Permissions::from_mode(hm.mode() & 0o7777)),
+            "cannot set the upper directory's mode",
+        );
+        // best effort: an xattr we can't copy only means the root shows up as SKIP
+        let _ = copy_xattrs(p, &upper);
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
 
     let pid = unsafe { libc::fork() };
@@ -790,14 +822,15 @@ fn record_base(env: &Env) {
     let mut buf = Vec::new();
     for p in env.overlays() {
         let u = env.upper(&p);
-        for rel in walk(&u) {
-            let h = p.join(&rel);
+        let entries = walk(&u).into_iter().map(|rel| (p.join(&rel), u.join(&rel)));
+        // the overlay root itself counts too: its mode and owner can change
+        for (h, up) in std::iter::once((p.clone(), u.clone())).chain(entries) {
             if seen.contains_key(&h) {
                 continue;
             }
             buf.extend_from_slice(h.as_os_str().as_bytes());
             buf.push(0);
-            buf.extend_from_slice(host_state(env, &h, &u.join(&rel)).as_bytes());
+            buf.extend_from_slice(host_state(env, &h, &up).as_bytes());
             buf.push(0);
         }
     }
@@ -849,8 +882,28 @@ fn changes(env: &Env) -> Vec<Change> {
     if env.state.is_none() {
         return out;
     }
+    // overlapping paths in .ovenv/paths could otherwise list a path twice
+    let mut emitted = HashSet::new();
     for p in env.overlays() {
         let u = env.upper(&p);
+        // The overlay root is the upper dir itself and is never copied up, so only its attributes can change.
+        if let (Some(um), Some(hm)) = (lstat(&u), lstat(&p)) {
+            let found = if xattrs(&u) != xattrs(&p) {
+                Some((Kind::Skip, "xattrs"))
+            } else if attrs(&um) != attrs(&hm) {
+                Some((Kind::Attr, ""))
+            } else {
+                None
+            };
+            if let Some((kind, note)) = found.filter(|_| emitted.insert(p.clone())) {
+                out.push(Change {
+                    kind,
+                    host: p.clone(),
+                    up: u.clone(),
+                    note,
+                });
+            }
+        }
         // directories whose host contents go away / whose staged contents are skipped
         let mut gone: Option<PathBuf> = None;
         let mut skip: Option<PathBuf> = None;
@@ -869,12 +922,14 @@ fn changes(env: &Env) -> Vec<Change> {
             let Some(um) = lstat(&up) else { continue };
             let hm = if gone.is_some() { None } else { lstat(&host) };
             let mut add = |kind, note| {
-                out.push(Change {
-                    kind,
-                    host: host.clone(),
-                    up: up.clone(),
-                    note,
-                })
+                if emitted.insert(host.clone()) {
+                    out.push(Change {
+                        kind,
+                        host: host.clone(),
+                        up: up.clone(),
+                        note,
+                    })
+                }
             };
 
             if is_whiteout(&um) {
