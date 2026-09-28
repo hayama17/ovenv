@@ -204,6 +204,11 @@ grep -qF "rw path $T/sysm/norw doesn't exist" <<<"$err" || fail "no warning for 
 [[ ! -e $T/sysm/new && ! -e $T/sysm/norw ]] || fail "run created a path on the host"
 mkdir "$T/sysm/new"  # the host creates the path mid-session; what is staged must stay visible
 grep -qxF "ADD     $T/sysm/new/x/f" <<<"$(ov diff)" || fail "staged changes hidden after the host created the path"
+err=$(ov run true 2>&1)
+! grep -q "changed since staging started" <<<"$err" || fail "warned about .ovenv/paths although only the host changed"
+echo "$T/sysm/other" >>.ovenv/paths
+err=$(ov run true 2>&1)
+grep -q "changed since staging started" <<<"$err" || fail "no warning after editing .ovenv/paths: $err"
 ov discard
 [[ -d $T/sysm/new && ! -e $T/sysm/new/x ]] || fail "discard after a missing staged path"
 

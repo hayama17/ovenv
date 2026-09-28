@@ -114,14 +114,19 @@ impl Env {
     }
 
     /// (writable straight through, path) for every line of .ovenv/paths or the defaults.
-    fn paths(&self) -> Vec<(bool, PathBuf)> {
-        let text = match fs::read_to_string(self.dir.join("paths")) {
+    /// .ovenv/paths, or the defaults when it doesn't exist.
+    fn paths_text(&self) -> String {
+        match fs::read_to_string(self.dir.join("paths")) {
             Ok(t) => t,
             Err(_) => match self.mode {
                 Mode::Root => ROOT_DEFAULT.join("\n"),
                 Mode::User => USER_DEFAULT.join("\n"),
             },
-        };
+        }
+    }
+
+    fn paths(&self) -> Vec<(bool, PathBuf)> {
+        let text = self.paths_text();
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| "/".into());
@@ -356,10 +361,16 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
     }
     let recorded = env.state().join("overlays");
     let fresh = lstat(&recorded).is_none();
+    // Compare the text, not the resolved set, which also moves when the host changes.
+    let paths_at_start = env.state().join("paths");
     let candidates = if fresh {
+        or_die(
+            fs::write(&paths_at_start, env.paths_text()),
+            "cannot record .ovenv/paths",
+        );
         env.wanted_overlays(true)
     } else {
-        if env.overlays() != env.wanted_overlays(false) {
+        if fs::read_to_string(&paths_at_start).ok() != Some(env.paths_text()) {
             eprintln!("ovenv: .ovenv/paths changed since staging started; the staged paths stay until apply or discard");
         }
         env.overlays()
