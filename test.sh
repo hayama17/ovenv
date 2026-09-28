@@ -187,7 +187,7 @@ fi
 
 # A staged path inside the project is staged, although the rest of the project writes through.
 mkdir -p "$T/pc/.ovenv" "$T/pc/sys"; echo old >"$T/pc/sys/f"
-echo "$T/pc/sys" >"$T/pc/.ovenv/paths"
+printf '%s\n' "$T/pc/sys" "rw ." >"$T/pc/.ovenv/paths"
 cd "$T/pc"
 ov run sh -c "echo new > $T/pc/sys/f; echo b > $T/pc/built"
 [[ $(cat "$T/pc/sys/f") == old && -e $T/pc/built ]] || fail "staged path inside the project wrote through"
