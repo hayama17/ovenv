@@ -322,7 +322,45 @@ fn lock(env: &Env) -> File {
             env.dir.display()
         );
     }
+    check_session(env);
     f
+}
+
+fn mnt_ns(pid: &str) -> Option<(u64, u64)> {
+    fs::metadata(format!("/proc/{pid}/ns/mnt"))
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// A session's mount namespace outlives `ovenv run` while anything it started keeps running;
+/// applying or discarding then would change the layers under a live overlay.
+fn check_session(env: &Env) {
+    let Some(st) = &env.state else { return };
+    let Ok(id) = fs::read_to_string(st.join("session")) else {
+        return;
+    };
+    let parsed = id
+        .trim()
+        .split_once(':')
+        .and_then(|(d, i)| Some((d.parse::<u64>().ok()?, i.parse::<u64>().ok()?)));
+    let Some(ns) = parsed else { return };
+    // ponytail: a namespace inode can be reused after the session ends; that only causes a false refusal
+    let mut pids: Vec<u32> = fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| mnt_ns(&pid.to_string()) == Some(ns))
+        .collect();
+    if !pids.is_empty() {
+        pids.sort();
+        let list: Vec<String> = pids.iter().map(u32::to_string).collect();
+        die!(
+            "processes started in {} are still running (pid {}); stop them first",
+            env.dir.display(),
+            list.join(" ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------- run
@@ -431,14 +469,33 @@ fn run(mut env: Env, cmd: Vec<OsString>) -> ! {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
 
+    // The child reports its mount namespace through this pipe, so later commands can spot leftovers.
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        die!("pipe: {}", io::Error::last_os_error());
+    }
+    let (mut from_child, to_parent) = unsafe {
+        use std::os::fd::FromRawFd;
+        (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1]))
+    };
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         die!("fork: {}", io::Error::last_os_error());
     }
     if pid == 0 {
-        let err = enter(env, &ov, &rw, &cwd, uid, gid, &cmd);
+        drop(from_child);
+        let err = enter(env, &ov, &rw, &cwd, (uid, gid), &cmd, to_parent);
         eprintln!("ovenv: {err}");
         unsafe { libc::_exit(127) }
+    }
+    drop(to_parent);
+    let mut ns = String::new();
+    let _ = from_child.read_to_string(&mut ns);
+    if !ns.is_empty() {
+        or_die(
+            fs::write(env.state().join("session"), ns),
+            "cannot record the session",
+        );
     }
     // Keep waiting through Ctrl-C so the baseline still gets recorded; the child gets the signal itself.
     unsafe {
@@ -469,9 +526,9 @@ fn enter(
     ov: &[PathBuf],
     rw: &[PathBuf],
     cwd: &Path,
-    uid: u32,
-    gid: u32,
+    (uid, gid): (u32, u32),
     cmd: &[OsString],
+    report: File,
 ) -> String {
     let r = (|| -> Result<(), String> {
         if env.mode == Mode::User {
@@ -485,6 +542,10 @@ fn enter(
         } else {
             check(unsafe { libc::unshare(libc::CLONE_NEWNS) }, "unshare")?;
         }
+        if let Some((dev, ino)) = mnt_ns("self") {
+            let _ = (&report).write_all(format!("{dev}:{ino}").as_bytes());
+        }
+        drop(report);
         mount(
             None,
             Path::new("/"),
