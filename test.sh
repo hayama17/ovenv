@@ -148,6 +148,22 @@ grep -qxF "  $T/sys4" <<<"$err" || fail "deleted staged directory not reported: 
 [[ -d $(cat .ovenv/state) ]] || fail "refused apply dropped the staged state"
 ov discard
 
+# An unreadable staged directory stops diff and apply instead of hiding what is inside it (root reads it anyway).
+if [[ $EUID -ne 0 ]]; then
+  mkdir -p "$T/lockp/.ovenv" "$T/sys6"; echo "$T/sys6" >"$T/lockp/.ovenv/paths"
+  cd "$T/lockp"
+  ov run sh -c "mkdir $T/sys6/locked; echo important > $T/sys6/locked/f; chmod 000 $T/sys6/locked" 2>/dev/null
+  err=$(ov diff 2>&1) && fail "diff ignored an unreadable staged directory"
+  grep -qF "cannot read staged directory $T/sys6/locked" <<<"$err" || fail "unclear unreadable error: $err"
+  ! ov apply 2>/dev/null || fail "apply ignored an unreadable staged directory"
+  [[ ! -e $T/sys6/locked ]] || fail "refused apply changed the host"
+  ov run chmod 700 "$T/sys6/locked"
+  grep -qxF "ADD     $T/sys6/locked/f" <<<"$(ov diff)" || fail "file in a formerly unreadable dir not listed"
+  ov run chmod 000 "$T/sys6/locked" 2>/dev/null
+  ov discard || fail "discard failed on an unreadable staged directory"
+  [[ ! -e .ovenv/state ]] || fail "discard left the state behind"
+fi
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"

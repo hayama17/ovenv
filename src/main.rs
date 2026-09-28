@@ -723,9 +723,11 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> Option<usize> {
 }
 
 /// Relative paths below `root`, parents before children, siblings sorted.
-fn walk(root: &Path) -> Vec<PathBuf> {
-    fn go(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+/// Directories that can't be read go to `unreadable`, so callers decide whether a partial list is acceptable.
+fn walk(root: &Path, unreadable: &mut Vec<PathBuf>) -> Vec<PathBuf> {
+    fn go(root: &Path, rel: &Path, out: &mut Vec<PathBuf>, bad: &mut Vec<PathBuf>) {
         let Ok(rd) = fs::read_dir(root.join(rel)) else {
+            bad.push(rel.to_path_buf());
             return;
         };
         let mut names: Vec<OsString> = rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
@@ -734,13 +736,39 @@ fn walk(root: &Path) -> Vec<PathBuf> {
             let r = rel.join(&n);
             out.push(r.clone());
             if is_dir(&root.join(&r)) {
-                go(root, &r, out);
+                go(root, &r, out, bad);
             }
         }
     }
     let mut out = Vec::new();
-    go(root, Path::new(""), &mut out);
+    go(root, Path::new(""), &mut out, unreadable);
     out
+}
+
+/// walk() over a staged tree for diff and apply: a partial list would silently drop changes.
+fn walk_staged(u: &Path, p: &Path) -> Vec<PathBuf> {
+    let mut bad = Vec::new();
+    let list = walk(u, &mut bad);
+    if let Some(rel) = bad.first() {
+        die!(
+            "cannot read staged directory {}; make it readable in `ovenv run`, or `ovenv discard`",
+            p.join(rel).display()
+        );
+    }
+    list
+}
+
+/// Make every directory below `p` removable; a session may have left staged ones at mode 000.
+fn unlock_tree(p: &Path) {
+    if !is_dir(p) {
+        return;
+    }
+    let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
+    if let Ok(rd) = fs::read_dir(p) {
+        for e in rd.flatten() {
+            unlock_tree(&e.path());
+        }
+    }
 }
 
 fn kind_name(m: &Metadata) -> &'static str {
@@ -773,7 +801,13 @@ fn host_state(env: &Env, h: &Path, up: &Path) -> String {
         // contents only matter when the staged entry deletes or replaces the whole directory
         if !is_dir(up) || is_opaque(env, up) {
             let mut hasher = Sha256::new();
-            for rel in walk(h) {
+            let mut bad = Vec::new();
+            let entries = walk(h, &mut bad);
+            for rel in &bad {
+                hasher.update(b"unreadable\0");
+                hasher.update(rel.as_os_str().as_bytes());
+            }
+            for rel in entries {
                 let Some(cm) = lstat(&h.join(&rel)) else {
                     continue;
                 };
@@ -832,7 +866,15 @@ fn record_base(env: &Env) {
     let mut buf = Vec::new();
     for p in env.overlays() {
         let u = env.upper(&p);
-        let entries = walk(&u).into_iter().map(|rel| (p.join(&rel), u.join(&rel)));
+        let mut bad = Vec::new();
+        let entries = walk(&u, &mut bad);
+        for rel in &bad {
+            eprintln!(
+                "ovenv: cannot read staged {}; it is recorded once it is readable",
+                p.join(rel).display()
+            );
+        }
+        let entries = entries.into_iter().map(|rel| (p.join(&rel), u.join(&rel)));
         // the overlay root itself counts too: its mode and owner can change
         for (h, up) in std::iter::once((p.clone(), u.clone())).chain(entries) {
             if seen.contains_key(&h) {
@@ -915,7 +957,7 @@ fn changes(env: &Env) -> Vec<Change> {
         // directories whose host contents go away / whose staged contents are skipped
         let mut gone: Option<PathBuf> = None;
         let mut skip: Option<PathBuf> = None;
-        for rel in walk(&u) {
+        for rel in walk_staged(&u, &p) {
             if gone.as_ref().is_some_and(|g| !rel.starts_with(g)) {
                 gone = None;
             }
@@ -1040,7 +1082,7 @@ fn show_diff(env: &Env, content: bool) {
         }
         let _ = writeln!(out);
     }
-    let staged: u64 = walk(&env.state().join("upper"))
+    let staged: u64 = walk(&env.state().join("upper"), &mut Vec::new())
         .iter()
         .filter_map(|r| lstat(&env.state().join("upper").join(r)))
         .map(|m| m.blocks() * 512)
@@ -1288,14 +1330,8 @@ fn apply(env: &Env, force: bool, drop_skipped: bool) {
 /// Remove the staged state; .ovenv/paths stays.
 fn discard_files(env: &Env) {
     if let Some(st) = env.state.as_ref().filter(|st| lstat(st).is_some()) {
-        // overlay leaves a mode-000 dir in workdir, which blocks removal for non-root
-        let work = st.join("work");
-        for rel in std::iter::once(PathBuf::new()).chain(walk(&work)) {
-            let p = work.join(rel);
-            if is_dir(&p) {
-                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-            }
-        }
+        // overlay leaves a mode-000 dir in workdir, and staged dirs may be 000 too; both block removal for non-root
+        unlock_tree(st);
         or_die(remove(st), format!("cannot remove {}", st.display()));
     }
     for name in ["state", "mode"] {
