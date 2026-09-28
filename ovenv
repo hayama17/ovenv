@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ovenv: stage a command's filesystem side effects in OverlayFS, then review, apply or discard them.
 set -euo pipefail
+shopt -s inherit_errexit
 
-VERSION=0.1.0
+VERSION=0.2.0
 SELF=$(realpath "$0")
 
 ROOT_DEFAULT='/usr
@@ -53,15 +54,15 @@ paths() {
 
 overlays() { paths | sed -n 's/^overlay\t//p'; }
 
+# One run, shell, apply or discard per .ovenv; held until that command has fully finished.
 lock() {
   mkdir -p "$D"
   touch "$D/lock"
   exec 9<"$D/lock"  # read-only: an fd open for writing makes the ro remount fail with EBUSY
-  flock "$1" 9 || die "a session is still running in $D"
+  flock -xn 9 || die "$D is in use by another ovenv run, shell, apply or discard"
 }
 
 enter() {
-  lock -s
   local p xopt=''
   local -a ov=() rw=("$PROJECT" /tmp)
   [[ $MODE == user ]] && xopt=,userxattr
@@ -98,107 +99,246 @@ enter() {
 }
 
 run() {
-  mkdir -p "$D"
+  need_getfattr
+  lock
   [[ -f $D/mode ]] || echo "$MODE" >"$D/mode"
-  [[ -f $D/base ]] || date +%s >"$D/base"
+  local rc=0
+  trap : INT TERM  # a handler, not an ignore, so the command still gets the signal
   if [[ $MODE == root ]]; then
-    exec unshare -m "$SELF" __enter "$@"
+    unshare -m "$SELF" __enter "$@" || rc=$?
+  else
+    OVENV_UID=$(id -u) OVENV_GID=$(id -g) unshare -Urm "$SELF" __enter "$@" || rc=$?
   fi
-  OVENV_UID=$(id -u) OVENV_GID=$(id -g) exec unshare -Urm "$SELF" __enter "$@"
+  record_base
+  exit "$rc"
 }
 
-is_opaque() {
-  [[ $(getfattr --absolute-names --only-values -n "$XATTR" "$1" 2>/dev/null) == y ]]
+need_getfattr() { command -v getfattr >/dev/null || die "getfattr not found (install the attr package)"; }
+is_opaque() { [[ $(getfattr --absolute-names --only-values -n "$XATTR" "$1" 2>/dev/null) == y ]]; }
+is_whiteout() { [[ -c $1 && ! -L $1 && $(stat -c %t%T "$1") == 00 ]]; }
+is_dir() { [[ -d $1 && ! -L $1 ]]; }
+exists() { [[ -e $1 || -L $1 ]]; }
+attrs() { stat -c %a:%u:%g "$1"; }
+xattrs() {
+  getfattr -h -d -m - -e hex --absolute-names "$1" 2>/dev/null |
+    grep -Ev '^(#|$)|^(trusted|user)\.overlay\.|^security\.selinux=' | sort || true
 }
 
-# Prints "KIND<TAB>overlay path<TAB>relative path" for every real change.
-changes() {
-  local p u f up host
-  command -v getfattr >/dev/null || echo "ovenv: getfattr not found; replaced directories show as edits" >&2
+# What the host has at $1, precise enough to notice any change apply could overwrite.
+host_state() {
+  local h=$1 up=$2
+  if [[ -L $h ]]; then
+    printf 'l %s' "$(readlink "$h")"
+  elif [[ ! -e $h ]]; then
+    printf -
+  elif [[ -d $h ]]; then
+    printf 'd %s' "$(attrs "$h")"
+    # contents only matter when the staged entry deletes or replaces the whole directory
+    if ! is_dir "$up" || is_opaque "$up"; then
+      printf ' %s' "$(find "$h" -mindepth 1 -printf '%P %y %m %U %G %s %T@ %l\n' | sort | sha256sum | cut -c1-64)"
+    fi
+  elif [[ -f $h ]]; then
+    printf 'f %s %s' "$(attrs "$h")" "$( (sha256sum <"$h" || echo unreadable) | cut -c1-64)"
+  else
+    printf 'o %s' "$(stat -c %F "$h")"
+  fi
+}
+
+# Remember what the host looked like when each path was first staged; apply checks against it.
+record_base() {
+  local p u f
+  local -A seen=()
+  if [[ -f $D/base ]]; then
+    while IFS=$'\t' read -r f _; do seen[$f]=1; done <"$D/base"
+  fi
   while read -r p; do
     u=$D/upper$p
     [[ -d $u ]] || continue
+    while IFS= read -r -d '' f; do
+      [[ -n ${seen[$p/$f]:-} ]] && continue
+      printf '%s\t%s\n' "$p/$f" "$(host_state "$p/$f" "$u/$f")"
+    done < <(cd "$u" && find . -mindepth 1 -printf '%P\0') >>"$D/base"
+  done < <(overlays)
+}
+
+# Prints "KIND<TAB>overlay path<TAB>relative path<TAB>note". diff, the conflict check and apply all use this.
+changes() {
+  local p u f up h hp gone skip
+  while read -r p; do
+    u=$D/upper$p
+    [[ -d $u ]] || continue
+    gone='' skip=''  # directories whose host contents are replaced / whose staged contents are skipped
     # ponytail: newlines and tabs in filenames are not handled
     while IFS= read -r -d '' f; do
-      up=$u/$f host=$p/$f
-      if [[ -c $up && $(stat -c %t%T "$up") == 00 ]]; then
-        [[ -e $host || -L $host ]] && printf 'DELETE\t%s\t%s\n' "$p" "$f"
-      elif [[ -d $up && ! -L $up ]]; then
-        if [[ -e $host || -L $host ]] && { is_opaque "$up" || [[ ! -d $host || -L $host ]]; }; then
-          printf 'REPLACE\t%s\t%s\n' "$p" "$f"
+      [[ -n $gone && $f != "$gone"/* ]] && gone=''
+      [[ -n $skip && $f != "$skip"/* ]] && skip=''
+      [[ -n $skip ]] && continue
+      up=$u/$f h=$p/$f hp=''
+      [[ -z $gone ]] && exists "$h" && hp=1
+
+      if is_whiteout "$up"; then
+        [[ -n $hp ]] && printf 'DELETE\t%s\t%s\t\n' "$p" "$f"
+        continue
+      fi
+      if ! is_dir "$up" && [[ ! -f $up && ! -L $up ]]; then
+        printf 'SKIP\t%s\t%s\tspecial file\n' "$p" "$f"
+        continue
+      fi
+      if [[ $(xattrs "$up") != "$([[ -n $hp ]] && xattrs "$h")" ]]; then
+        printf 'SKIP\t%s\t%s\txattrs\n' "$p" "$f"
+        is_dir "$up" && skip=$f
+        continue
+      fi
+
+      if is_dir "$up"; then
+        if [[ -z $hp ]]; then
+          printf 'ADD\t%s\t%s\t\n' "$p" "$f"
+        elif ! is_dir "$h" || is_opaque "$up"; then
+          printf 'REPLACE\t%s\t%s\t\n' "$p" "$f"
+          gone=$f
+        elif [[ $(attrs "$up") != "$(attrs "$h")" ]]; then
+          printf 'ATTR\t%s\t%s\t\n' "$p" "$f"
         fi
-      elif [[ ! -e $host && ! -L $host ]]; then
-        printf 'ADD\t%s\t%s\n' "$p" "$f"
-      elif [[ -d $host && ! -L $host ]]; then
-        printf 'REPLACE\t%s\t%s\n' "$p" "$f"
-      elif [[ -L $up || -L $host ]]; then
-        [[ $(readlink "$up") == "$(readlink "$host")" ]] || printf 'MODIFY\t%s\t%s\n' "$p" "$f"
-      elif ! cmp -s "$up" "$host"; then
-        printf 'MODIFY\t%s\t%s\n' "$p" "$f"
-      # copy-up also happens on touch, so only report mode/owner changes
-      elif [[ $(stat -c %a:%u:%g "$up") != "$(stat -c %a:%u:%g "$host")" ]]; then
-        printf 'ATTR\t%s\t%s\n' "$p" "$f"
+      elif [[ -z $hp ]]; then
+        printf 'ADD\t%s\t%s\t\n' "$p" "$f"
+      elif is_dir "$h"; then
+        printf 'REPLACE\t%s\t%s\t\n' "$p" "$f"
+      elif [[ -L $up && -L $h ]]; then
+        if [[ $(readlink "$up") != "$(readlink "$h")" ]]; then
+          printf 'MODIFY\t%s\t%s\t\n' "$p" "$f"
+        elif [[ $(stat -c %u:%g "$up") != "$(stat -c %u:%g "$h")" ]]; then
+          printf 'SKIP\t%s\t%s\tsymlink owner\n' "$p" "$f"
+        fi
+      elif [[ -L $up || -L $h || ! -f $h ]] || ! cmp -s "$up" "$h"; then
+        printf 'MODIFY\t%s\t%s\t\n' "$p" "$f"
+      # copy-up also happens on touch, so a file with the same content and attrs is not a change
+      elif [[ $(attrs "$up") != "$(attrs "$h")" ]]; then
+        printf 'ATTR\t%s\t%s\t\n' "$p" "$f"
       fi
     done < <(cd "$u" && find . -mindepth 1 -printf '%P\0')
   done < <(overlays)
   return 0
 }
 
+describe() { if [[ -L $1 ]]; then echo "symlink -> $(readlink "$1")"; else stat -c %F "$1"; fi; }
+
 show_diff() {
-  local out
-  out=$(changes | awk -F'\t' '{ printf "%-8s%s/%s\n", $1, $2, $3 }')
-  [[ -z $out ]] && return 0
-  echo "$out"
+  local content=${1:-} t p f note up h out
+  local -a lines=()
+  need_getfattr
+  out=$(changes) || die "cannot read staged changes"
+  [[ -n $out ]] && mapfile -t lines <<<"$out"
+  (( ${#lines[@]} )) || return 0
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r t p f note <<<"$l"
+    printf '%-8s%s/%s' "$t" "$p" "$f"
+    if is_dir "$D/upper$p/$f" || { [[ $t == DELETE ]] && is_dir "$p/$f"; }; then printf /; fi
+    [[ -n $note ]] && printf '  (%s, not applied)' "$note"
+    echo
+  done
   echo
   du -sh "$D/upper" | cut -f1 | sed 's/$/ staged/'
+  [[ $content == --content ]] || return 0
+
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r t p f note <<<"$l"
+    [[ $t == MODIFY ]] || continue
+    up=$D/upper$p/$f h=$p/$f
+    echo
+    if [[ -L $up || -L $h ]]; then
+      printf -- '--- host:%s\n+++ staged:%s\n-%s\n+%s\n' "$h" "$h" "$(describe "$h")" "$(describe "$up")"
+    else
+      diff -u --label "host:$h" --label "staged:$h" -- "$h" "$up" || [[ $? -eq 1 ]] || die "cannot compare $h"
+    fi
+  done
 }
 
-discard() {
-  lock -xn
+own() { if [[ $MODE == root ]]; then chown -h "$(stat -c %u:%g "$1")" "$2"; fi; }
+
+# Put a copy of regular file or symlink $1 at $2 with rename(2), so $2 is never missing or half-written.
+put() {
+  local up=$1 h=$2 tmp
+  if [[ -L $up ]]; then
+    tmp=$(mktemp -u "$(dirname "$h")/.ovenv.XXXXXXXX")
+    ln -s -- "$(readlink "$up")" "$tmp" || die "cannot create a temp file next to $h"
+  else
+    tmp=$(mktemp "$(dirname "$h")/.ovenv.XXXXXXXX") || die "cannot create a temp file next to $h"
+    if ! { cat -- "$up" >"$tmp" && own "$up" "$tmp" && chmod "$(stat -c %a "$up")" "$tmp"; }; then
+      rm -f -- "$tmp"
+      die "cannot prepare $h; left it unchanged"
+    fi
+  fi
+  # The temp file sits in the same directory, so mv is a plain rename and never falls back to copying.
+  mv -fT -- "$tmp" "$h" || { rm -f -- "$tmp"; die "cannot replace $h; left it unchanged"; }
+}
+
+discard_files() {
   chmod -R u+rwx "$D/work" 2>/dev/null || true  # overlay leaves a mode-000 dir that blocks rm
   rm -rf "$D/upper" "$D/work" "$D/base" "$D/mode"
 }
 
+discard() { lock; discard_files; }
+
 apply() {
-  local force=${1:-} base t p f h u
-  # without it, recreated directories are applied as merges and stale files stay on the host
-  command -v getfattr >/dev/null || die "apply needs getfattr (the attr package)"
-  lock -xn
-  base=$(cat "$D/base" 2>/dev/null || echo 0)
-  local -a lines=() conflicts=()
-  mapfile -t lines < <(changes)
-  if [[ $force != --force ]]; then
-    for l in "${lines[@]}"; do
-      IFS=$'\t' read -r t p f <<<"$l"
-      h=$p/$f
-      # ponytail: a file deleted on the host after staging shows as ADD and is silently re-created
-      if [[ -e $h || -L $h ]] && (( $(stat -c %Z "$h") > base )); then conflicts+=("$h"); fi
-    done
-    if (( ${#conflicts[@]} )); then
-      printf 'ovenv: changed on the host since staging started:\n' >&2
-      printf '  %s\n' "${conflicts[@]}" >&2
-      die "review them, then rerun with --force"
-    fi
+  local force=${1:-} t p f note h up i out
+  need_getfattr
+  lock
+  local -a lines=() conflicts=() skipped=() dirmodes=()
+  local -A base=() made=()
+  out=$(changes) || die "cannot read staged changes"
+  [[ -n $out ]] && mapfile -t lines <<<"$out"
+  if [[ -f $D/base ]]; then
+    while IFS=$'\t' read -r h note; do base[$h]=$note; done <"$D/base"
   fi
 
   for l in "${lines[@]}"; do
-    IFS=$'\t' read -r t p f <<<"$l"
-    [[ $t == DELETE || $t == REPLACE ]] && rm -rf -- "${p:?}/$f"
+    IFS=$'\t' read -r t p f note <<<"$l"
+    h=$p/$f up=$D/upper$p/$f
+    if [[ $t == SKIP ]]; then skipped+=("$h ($note)"); continue; fi
+    if [[ -z ${base[$h]+x} ]]; then
+      conflicts+=("$h (no record of the host state)")
+    elif [[ $(host_state "$h" "$up") != "${base[$h]}" ]]; then
+      conflicts+=("$h")
+    fi
+    [[ $t == ADD || $t == REPLACE ]] && is_dir "$up" && made[$h]=1
+    if [[ $t == ADD ]] && ! is_dir "$(dirname "$h")" && [[ -z ${made[$(dirname "$h")]:-} ]]; then
+      conflicts+=("$(dirname "$h") (parent directory is gone)")
+    fi
   done
-  while read -r p; do
-    u=$D/upper$p
-    [[ -d $u ]] || continue
-    (cd "$u" && find . -mindepth 1 -print0 |
-      while IFS= read -r -d '' f; do
-        [[ -c $f && $(stat -c %t%T "$f") == 00 ]] || printf '%s\0' "$f"
-      done |
-      tar --null --no-recursion -T - --xattrs \
-        --xattrs-exclude='trusted.overlay.*' --xattrs-exclude='user.overlay.*' -cf -) |
-      tar -C "$p" --xattrs -xpf -
-  done < <(overlays)
-  echo "applied ${#lines[@]} change(s)"
-  flock -u 9
-  discard
+  if (( ${#conflicts[@]} )) && [[ $force != --force ]]; then
+    printf 'ovenv: changed on the host since it was staged:\n' >&2
+    printf '  %s\n' "${conflicts[@]}" >&2
+    die "review them, then rerun with --force"
+  fi
+
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r t p f note <<<"$l"
+    h=$p/$f up=$D/upper$p/$f
+    case $t in
+      SKIP) ;;
+      DELETE) rm -rf -- "$h" ;;
+      ATTR)
+        own "$up" "$h"
+        if is_dir "$up"; then dirmodes+=("$(stat -c %a "$up") $h"); else chmod "$(stat -c %a "$up")" "$h"; fi
+        ;;
+      ADD|REPLACE|MODIFY)
+        [[ $t == REPLACE ]] && rm -rf -- "$h"
+        if is_dir "$up"; then
+          mkdir -m 700 -- "$h"
+          own "$up" "$h"
+          dirmodes+=("$(stat -c %a "$up") $h")
+        else
+          put "$up" "$h"
+        fi
+        ;;
+    esac
+  done
+  # Directory modes go last, deepest first, so a read-only directory doesn't block writes below it.
+  for (( i=${#dirmodes[@]}-1; i>=0; i-- )); do chmod "${dirmodes[i]%% *}" "${dirmodes[i]#* }"; done
+
+  (( ${#skipped[@]} )) && printf 'not applied: %s\n' "${skipped[@]}"
+  echo "applied $(( ${#lines[@]} - ${#skipped[@]} )) change(s)"
+  discard_files
 }
 
 init() {
@@ -220,7 +360,7 @@ usage: ovenv <command>
   init              create .ovenv/ in the current directory
   run <cmd>...      run a command with its writes staged
   shell             start \$SHELL with writes staged
-  diff              show staged changes
+  diff [--content]  show staged changes (--content adds diff -u for modified files)
   apply [--force]   write staged changes to the host
   discard           throw staged changes away
 
@@ -233,7 +373,7 @@ case ${1:-} in
   run)       shift; [[ $# -gt 0 ]] || die "usage: ovenv run <cmd>..."; run "$@" ;;
   shell)     run "${SHELL:-/bin/sh}" ;;
   __enter)   shift; enter "$@" ;;
-  diff)      show_diff ;;
+  diff)      shift; show_diff "$@" ;;
   apply)     shift; apply "$@" ;;
   discard)   discard ;;
   --version) echo "ovenv $VERSION" ;;
