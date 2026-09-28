@@ -1,0 +1,19 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck ovenv test.sh
+      # Ubuntu 24.04 blocks unprivileged user namespaces by default.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: user mode
+        run: ./test.sh
+      - name: root mode
+        run: sudo ./test.sh

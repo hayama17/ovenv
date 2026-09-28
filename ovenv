@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# ovenv: stage a command's filesystem side effects in OverlayFS, then review, apply or discard them.
+set -euo pipefail
+
+VERSION=0.1.0
+SELF=$(realpath "$0")
+
+ROOT_DEFAULT='/usr
+/opt
+/etc
+/var
+/root'
+# shellcheck disable=SC2088  # expanded in paths()
+USER_DEFAULT='~/.local
+~/.cargo
+~/.npm
+~/.cache
+~/.config'
+
+die() { echo "ovenv: $*" >&2; exit 1; }
+
+find_dir() {
+  local d=$PWD
+  while [[ $d != / ]]; do
+    [[ -d $d/.ovenv ]] && { echo "$d/.ovenv"; return; }
+    d=$(dirname "$d")
+  done
+  echo "$PWD/.ovenv"
+}
+
+D=$(realpath -m "${OVENV_DIR:-$(find_dir)}")
+PROJECT=$(dirname "$D")
+
+# root and user mode store overlay metadata in different xattr namespaces, so an env sticks to one.
+if [[ -f $D/mode ]]; then MODE=$(<"$D/mode"); elif [[ $EUID -eq 0 ]]; then MODE=root; else MODE=user; fi
+if [[ ${1:-} != __enter ]]; then  # inside the user namespace EUID is 0
+  [[ $MODE == root && $EUID -ne 0 ]] && die "$D was created as root; use sudo"
+  [[ $MODE == user && $EUID -eq 0 ]] && die "$D was created without root; run without sudo"
+fi
+if [[ $MODE == root ]]; then XATTR=trusted.overlay.opaque; else XATTR=user.overlay.opaque; fi
+
+# Prints "overlay<TAB>path" or "rw<TAB>path".
+paths() {
+  local src a b
+  if [[ -f $D/paths ]]; then src=$(<"$D/paths"); elif [[ $MODE == root ]]; then src=$ROOT_DEFAULT; else src=$USER_DEFAULT; fi
+  while read -r a b; do
+    [[ -z $a || $a == \#* ]] && continue
+    if [[ $a == rw ]]; then a=$b; printf rw; else printf overlay; fi
+    a=${a/#\~/$HOME}
+    printf '\t%s\n' "$(realpath -m "$a")"
+  done <<<"$src"
+}
+
+overlays() { paths | sed -n 's/^overlay\t//p'; }
+
+lock() {
+  mkdir -p "$D"
+  touch "$D/lock"
+  exec 9<"$D/lock"  # read-only: an fd open for writing makes the ro remount fail with EBUSY
+  flock "$1" 9 || die "a session is still running in $D"
+}
+
+enter() {
+  lock -s
+  local p xopt=''
+  local -a ov=() rw=("$PROJECT" /tmp)
+  [[ $MODE == user ]] && xopt=,userxattr
+  while IFS=$'\t' read -r kind p; do
+    if [[ $kind == rw ]]; then rw+=("$p"); continue; fi
+    [[ $D == "$p" || $D == "$p"/* ]] && die "$D is inside overlay path $p"
+    if [[ $MODE == user && -e $p && ! -O $p ]]; then echo "ovenv: skipping $p (needs root)" >&2; continue; fi
+    ov+=("$p")
+  done < <(paths)
+
+  # Overlay needs a writable upper at mount time, so mount before making everything read-only.
+  for p in "${ov[@]}"; do
+    mkdir -p "$p" "$D/upper$p" "$D/work$p"
+    mount -t overlay ovenv -o "lowerdir=$p,upperdir=$D/upper$p,workdir=$D/work$p$xopt" "$p"
+  done
+  # Anything not overlaid or passed through is read-only, so writes can't silently reach the host.
+  mount -o remount,bind,ro=recursive /
+  mount -o remount,bind,rw=recursive /proc
+  mount -o remount,bind,rw=recursive /dev
+  for p in "${ov[@]}"; do mount -o remount,bind,rw "$p"; done
+  for p in "${rw[@]}"; do
+    [[ -e $p ]] || continue
+    mount --bind "$p" "$p"
+    mount -o remount,bind,rw "$p"
+  done
+
+  # Re-resolve cwd, otherwise it still points below the new mounts.
+  cd "$PWD" 2>/dev/null || cd /
+  export OVENV=$D
+  if [[ $MODE == user ]]; then
+    exec unshare -U --map-user="$OVENV_UID" --map-group="$OVENV_GID" "$@"
+  fi
+  exec "$@"
+}
+
+run() {
+  mkdir -p "$D"
+  [[ -f $D/mode ]] || echo "$MODE" >"$D/mode"
+  [[ -f $D/base ]] || date +%s >"$D/base"
+  if [[ $MODE == root ]]; then
+    exec unshare -m "$SELF" __enter "$@"
+  fi
+  OVENV_UID=$(id -u) OVENV_GID=$(id -g) exec unshare -Urm "$SELF" __enter "$@"
+}
+
+is_opaque() {
+  [[ $(getfattr --absolute-names --only-values -n "$XATTR" "$1" 2>/dev/null) == y ]]
+}
+
+# Prints "KIND<TAB>overlay path<TAB>relative path" for every real change.
+changes() {
+  local p u f up host
+  command -v getfattr >/dev/null || echo "ovenv: getfattr not found; replaced directories show as edits" >&2
+  while read -r p; do
+    u=$D/upper$p
+    [[ -d $u ]] || continue
+    # ponytail: newlines and tabs in filenames are not handled
+    while IFS= read -r -d '' f; do
+      up=$u/$f host=$p/$f
+      if [[ -c $up && $(stat -c %t%T "$up") == 00 ]]; then
+        [[ -e $host || -L $host ]] && printf 'DELETE\t%s\t%s\n' "$p" "$f"
+      elif [[ -d $up && ! -L $up ]]; then
+        if [[ -e $host || -L $host ]] && { is_opaque "$up" || [[ ! -d $host || -L $host ]]; }; then
+          printf 'REPLACE\t%s\t%s\n' "$p" "$f"
+        fi
+      elif [[ ! -e $host && ! -L $host ]]; then
+        printf 'ADD\t%s\t%s\n' "$p" "$f"
+      elif [[ -d $host && ! -L $host ]]; then
+        printf 'REPLACE\t%s\t%s\n' "$p" "$f"
+      elif [[ -L $up || -L $host ]]; then
+        [[ $(readlink "$up") == "$(readlink "$host")" ]] || printf 'MODIFY\t%s\t%s\n' "$p" "$f"
+      elif ! cmp -s "$up" "$host"; then
+        printf 'MODIFY\t%s\t%s\n' "$p" "$f"
+      # copy-up also happens on touch, so only report mode/owner changes
+      elif [[ $(stat -c %a:%u:%g "$up") != "$(stat -c %a:%u:%g "$host")" ]]; then
+        printf 'ATTR\t%s\t%s\n' "$p" "$f"
+      fi
+    done < <(cd "$u" && find . -mindepth 1 -printf '%P\0')
+  done < <(overlays)
+  return 0
+}
+
+show_diff() {
+  local out
+  out=$(changes | awk -F'\t' '{ printf "%-8s%s/%s\n", $1, $2, $3 }')
+  [[ -z $out ]] && return 0
+  echo "$out"
+  echo
+  du -sh "$D/upper" | cut -f1 | sed 's/$/ staged/'
+}
+
+discard() {
+  lock -xn
+  chmod -R u+rwx "$D/work" 2>/dev/null || true  # overlay leaves a mode-000 dir that blocks rm
+  rm -rf "$D/upper" "$D/work" "$D/base" "$D/mode"
+}
+
+apply() {
+  local force=${1:-} base t p f h u
+  lock -xn
+  base=$(cat "$D/base" 2>/dev/null || echo 0)
+  local -a lines=() conflicts=()
+  mapfile -t lines < <(changes)
+  if [[ $force != --force ]]; then
+    for l in "${lines[@]}"; do
+      IFS=$'\t' read -r t p f <<<"$l"
+      h=$p/$f
+      # ponytail: a file deleted on the host after staging shows as ADD and is silently re-created
+      if [[ -e $h || -L $h ]] && (( $(stat -c %Z "$h") > base )); then conflicts+=("$h"); fi
+    done
+    if (( ${#conflicts[@]} )); then
+      printf 'ovenv: changed on the host since staging started:\n' >&2
+      printf '  %s\n' "${conflicts[@]}" >&2
+      die "review them, then rerun with --force"
+    fi
+  fi
+
+  for l in "${lines[@]}"; do
+    IFS=$'\t' read -r t p f <<<"$l"
+    [[ $t == DELETE || $t == REPLACE ]] && rm -rf -- "${p:?}/$f"
+  done
+  while read -r p; do
+    u=$D/upper$p
+    [[ -d $u ]] || continue
+    (cd "$u" && find . -mindepth 1 -print0 |
+      while IFS= read -r -d '' f; do
+        [[ -c $f && $(stat -c %t%T "$f") == 00 ]] || printf '%s\0' "$f"
+      done |
+      tar --null --no-recursion -T - --xattrs \
+        --xattrs-exclude='trusted.overlay.*' --xattrs-exclude='user.overlay.*' -cf -) |
+      tar -C "$p" --xattrs -xpf -
+  done < <(overlays)
+  echo "applied ${#lines[@]} change(s)"
+  flock -u 9
+  discard
+}
+
+init() {
+  [[ -e $PWD/.ovenv ]] && die ".ovenv already exists"
+  mkdir -p "$PWD/.ovenv"
+  {
+    echo "# One path per line. Writes under these paths are staged in OverlayFS."
+    echo "# Prefix with 'rw ' to let writes go straight to the host."
+    echo "# Everything else is read-only inside ovenv, except this project, /tmp, /dev and /proc."
+    if [[ $EUID -eq 0 ]]; then echo "$ROOT_DEFAULT"; else echo "$USER_DEFAULT"; fi
+  } >"$PWD/.ovenv/paths"
+  echo "created $PWD/.ovenv (add it to .gitignore)"
+}
+
+usage() {
+  cat <<EOF
+usage: ovenv <command>
+
+  init              create .ovenv/ in the current directory
+  run <cmd>...      run a command with its writes staged
+  shell             start \$SHELL with writes staged
+  diff              show staged changes
+  apply [--force]   write staged changes to the host
+  discard           throw staged changes away
+
+Run with sudo to stage writes to system paths (/usr, /etc, ...).
+EOF
+}
+
+case ${1:-} in
+  init)      init ;;
+  run)       shift; [[ $# -gt 0 ]] || die "usage: ovenv run <cmd>..."; run "$@" ;;
+  shell)     run "${SHELL:-/bin/sh}" ;;
+  __enter)   shift; enter "$@" ;;
+  diff)      show_diff ;;
+  apply)     shift; apply "$@" ;;
+  discard)   discard ;;
+  --version) echo "ovenv $VERSION" ;;
+  -h|--help|help) usage ;;
+  *)         usage >&2; exit 2 ;;
+esac
