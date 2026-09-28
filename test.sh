@@ -21,6 +21,8 @@ echo x >touched; touch -d 2020-01-01 touched
 echo keep >mode; chmod 644 mode
 echo x >d/old; echo x >pd/f; chmod 755 pd; echo x >deldir/f; echo x >d2f/f; echo x >f2d
 printf '\0\1old' >bin.dat; ln -s a link
+echo old >xkeep; echo x >xattr-mode; chmod 644 xattr-mode
+setfattr -n user.ovenv_keep -v 1 xkeep; setfattr -n user.ovenv_keep -v 1 xattr-mode
 cd "$T/proj"
 
 ov run sh -c "
@@ -32,6 +34,7 @@ ov run sh -c "
   rm -rf d2f; echo file > d2f; rm f2d; mkdir f2d; echo in > f2d/in
   printf '\0\1new' > bin.dat; ln -sfn b link
   echo x > xa; setfattr -n user.ovenv_test -v 1 xa
+  echo new > xkeep; chmod 600 xattr-mode
   touch $T/out/x 2>/dev/null && echo leak > $T/proj/leak || true
   echo b > $T/proj/built; echo s > $T/share/s; id -u > $T/proj/uid
   touch $T/proj/.ovenv/x 2>/dev/null && echo leak > $T/proj/ovenv-writable || true
@@ -53,7 +56,8 @@ echo "$out"
 for want in "ADD     $S/bin/tool" "MODIFY  $S/conf" "DELETE  $S/gone" "ATTR    $S/mode" \
             "REPLACE $S/d/" "ADD     $S/d/new" "ADD     $S/emptydir/" "ATTR    $S/pd/" \
             "DELETE  $S/deldir/" "REPLACE $S/d2f" "REPLACE $S/f2d/" "ADD     $S/f2d/in" \
-            "MODIFY  $S/link" "MODIFY  $S/bin.dat" "SKIP    $S/xa  (xattrs, not applied)"; do
+            "MODIFY  $S/link" "MODIFY  $S/bin.dat" "SKIP    $S/xa  (xattrs, not applied)" \
+            "MODIFY  $S/xkeep" "ATTR    $S/xattr-mode"; do
   grep -qxF -- "$want" <<<"$out" || fail "missing: $want"
 done
 ! grep -q touched <<<"$out" || fail "touch-only file reported"
@@ -102,6 +106,8 @@ ov apply --force
 [[ $(readlink "$S/link") == b && $(tail -c3 "$S/bin.dat") == new ]] || fail "symlink/binary"
 [[ $(stat -c %Y "$S/touched") == "$mt" ]] || fail "touch-only file was applied"
 [[ ! -e $S/xa ]] || fail "skipped entry was applied"
+[[ $(cat "$S/xkeep") == new && $(getfattr --absolute-names --only-values -n user.ovenv_keep "$S/xkeep") == 1 ]] || fail "MODIFY dropped an unchanged xattr"
+[[ $(stat -c %a "$S/xattr-mode") == 600 && $(getfattr --absolute-names --only-values -n user.ovenv_keep "$S/xattr-mode") == 1 ]] || fail "ATTR dropped an unchanged xattr"
 [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left"
 [[ ! -e $ST && ! -e $T/proj/.ovenv/state && -f $T/proj/.ovenv/paths && -z $(ov diff) ]] || fail "not discarded after apply"
 

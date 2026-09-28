@@ -1045,7 +1045,11 @@ fn put(env: &Env, up: &Path, h: &Path) -> Result<(), String> {
     let tmp = loop {
         let tmp = dir.join(format!(".ovenv.{}", random_suffix()));
         let made = if um.file_type().is_symlink() {
-            fs::read_link(up).and_then(|t| symlink(t, &tmp))
+            fs::read_link(up).and_then(|t| symlink(t, &tmp)).and_then(|()| {
+                copy_xattrs(up, &tmp).inspect_err(|_| {
+                    let _ = fs::remove_file(&tmp);
+                })
+            })
         } else {
             (|| {
                 let mut f = OpenOptions::new()
@@ -1059,7 +1063,8 @@ fn put(env: &Env, up: &Path, h: &Path) -> Result<(), String> {
                         fchown(&f, Some(um.uid()), Some(um.gid()))?;
                     }
                     // after chown, which clears setuid bits
-                    f.set_permissions(fs::Permissions::from_mode(um.mode() & 0o7777))
+                    f.set_permissions(fs::Permissions::from_mode(um.mode() & 0o7777))?;
+                    copy_xattrs(up, &tmp)
                 })();
                 if prepared.is_err() {
                     let _ = fs::remove_file(&tmp);
@@ -1082,6 +1087,28 @@ fn put(env: &Env, up: &Path, h: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         format!("cannot replace {}: {e}; left it unchanged", h.display())
     })
+}
+
+/// Give `to` the xattrs of `from`. changes() only lets entries through whose xattrs match the host,
+/// so this keeps the host's xattrs on a new inode, and restores file capabilities that chown clears.
+fn copy_xattrs(from: &Path, to: &Path) -> io::Result<()> {
+    let c = cstr(to);
+    for (name, value) in xattrs(from) {
+        let n = CString::new(name).map_err(io::Error::other)?;
+        let r = unsafe {
+            libc::lsetxattr(
+                c.as_ptr(),
+                n.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn remove(p: &Path) -> io::Result<()> {
@@ -1147,6 +1174,7 @@ fn apply(env: &Env, force: bool) {
                     fs::set_permissions(h, fs::Permissions::from_mode(um.mode() & 0o7777))
                         .unwrap_or_else(fail);
                 }
+                copy_xattrs(&c.up, h).unwrap_or_else(fail);
             }
             Kind::Add | Kind::Replace | Kind::Modify => {
                 if c.kind == Kind::Replace {
@@ -1161,6 +1189,7 @@ fn apply(env: &Env, force: bool) {
                         .create(h)
                         .unwrap_or_else(fail);
                     own(env, &um, h).unwrap_or_else(fail);
+                    copy_xattrs(&c.up, h).unwrap_or_else(fail);
                     dirmodes.push((h.clone(), um.mode()));
                 } else {
                     put(env, &c.up, h).unwrap_or_else(|e| die!("{e}"));
