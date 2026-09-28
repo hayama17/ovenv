@@ -114,6 +114,27 @@ ov apply --force
 [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left"
 [[ ! -e $ST && ! -e $T/proj/.ovenv/state && -f $T/proj/.ovenv/paths && -z $(ov diff) ]] || fail "not discarded after apply"
 
+# A path under another staged path is covered by it, whatever the order, and leaves the parent's attributes alone.
+mkdir -p "$T/ovl/.ovenv" "$T/sys5/sub"; chmod 700 "$T/sys5"
+printf '%s\n' "$T/sys5/sub" "$T/sys5" >"$T/ovl/.ovenv/paths"
+cd "$T/ovl"
+ov run sh -c "echo x > $T/sys5/sub/f"
+out=$(ov diff)
+[[ $(head -n1 <<<"$out") == "ADD     $T/sys5/sub/f" && $(grep -c . <<<"$out") == 2 ]] || fail "overlapping paths: $out"
+ov apply >/dev/null
+[[ $(stat -c %a "$T/sys5") == 700 && -f $T/sys5/sub/f ]] || fail "overlapping paths changed the parent"
+
+# A staged directory deleted on the host is a conflict, and the staged state survives the refusal.
+mkdir -p "$T/rootgone/.ovenv" "$T/sys4"; chmod 755 "$T/sys4"
+echo "$T/sys4" >"$T/rootgone/.ovenv/paths"
+cd "$T/rootgone"
+ov run chmod 700 "$T/sys4"
+rmdir "$T/sys4"
+err=$(ov apply 2>&1) && fail "apply ignored a deleted staged directory"
+grep -qxF "  $T/sys4" <<<"$err" || fail "deleted staged directory not reported: $err"
+[[ -d $(cat .ovenv/state) ]] || fail "refused apply dropped the staged state"
+ov discard
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"

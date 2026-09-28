@@ -140,6 +140,16 @@ impl Env {
             };
             out.push((rw, resolve(&p)));
         }
+        // A path under another staged path is already staged by it; mounting both would nest one upper in the other.
+        let staged: Vec<PathBuf> = out
+            .iter()
+            .filter(|(rw, _)| !rw)
+            .map(|(_, p)| p.clone())
+            .collect();
+        let mut seen = HashSet::new();
+        out.retain(|(rw, p)| {
+            *rw || (!staged.iter().any(|q| q != p && p.starts_with(q)) && seen.insert(p.clone()))
+        });
         out
     }
 
@@ -882,20 +892,18 @@ fn changes(env: &Env) -> Vec<Change> {
     if env.state.is_none() {
         return out;
     }
-    // overlapping paths in .ovenv/paths could otherwise list a path twice
-    let mut emitted = HashSet::new();
     for p in env.overlays() {
         let u = env.upper(&p);
         // The overlay root is the upper dir itself and is never copied up, so only its attributes can change.
-        if let (Some(um), Some(hm)) = (lstat(&u), lstat(&p)) {
-            let found = if xattrs(&u) != xattrs(&p) {
-                Some((Kind::Skip, "xattrs"))
-            } else if attrs(&um) != attrs(&hm) {
-                Some((Kind::Attr, ""))
-            } else {
-                None
+        if let Some(um) = lstat(&u) {
+            let found = match lstat(&p) {
+                // gone from the host: listing it keeps it in the conflict check
+                None => Some((Kind::Add, "")),
+                Some(_) if xattrs(&u) != xattrs(&p) => Some((Kind::Skip, "xattrs")),
+                Some(hm) if attrs(&um) != attrs(&hm) => Some((Kind::Attr, "")),
+                _ => None,
             };
-            if let Some((kind, note)) = found.filter(|_| emitted.insert(p.clone())) {
+            if let Some((kind, note)) = found {
                 out.push(Change {
                     kind,
                     host: p.clone(),
@@ -922,14 +930,12 @@ fn changes(env: &Env) -> Vec<Change> {
             let Some(um) = lstat(&up) else { continue };
             let hm = if gone.is_some() { None } else { lstat(&host) };
             let mut add = |kind, note| {
-                if emitted.insert(host.clone()) {
-                    out.push(Change {
-                        kind,
-                        host: host.clone(),
-                        up: up.clone(),
-                        note,
-                    })
-                }
+                out.push(Change {
+                    kind,
+                    host: host.clone(),
+                    up: up.clone(),
+                    note,
+                })
             };
 
             if is_whiteout(&um) {
