@@ -585,14 +585,18 @@ fn enter(
             for d in [&upper, &work] {
                 fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
             }
-            // ponytail: commas and colons in paths are not escaped in the overlay options (#6)
-            let opts = format!(
-                "lowerdir={},upperdir={},workdir={}{xopt}",
-                p.display(),
-                upper.display(),
-                work.display()
-            );
-            mount(Some("ovenv"), p, Some("overlay"), 0, Some(&opts))?;
+            let mut opts = Vec::new();
+            for (key, dir) in [
+                ("lowerdir=", *p),
+                (",upperdir=", &upper),
+                (",workdir=", &work),
+            ] {
+                opts.extend_from_slice(key.as_bytes());
+                opts.extend(escape_opt(dir));
+            }
+            opts.extend_from_slice(xopt.as_bytes());
+            let opts = OsStr::from_bytes(&opts);
+            mount(Some(OsStr::new("ovenv")), p, Some("overlay"), 0, Some(opts))?;
         }
         // Anything not overlaid or passed through is read-only, so writes can't silently reach the host.
         set_readonly(Path::new("/"), true, true)?;
@@ -603,7 +607,7 @@ fn enter(
         }
         // The command may read ovenv's own bookkeeping but must not change it.
         for p in [&env.dir, env.state()] {
-            mount(Some(&p.to_string_lossy()), p, None, libc::MS_BIND, None)?;
+            mount(Some(p.as_os_str()), p, None, libc::MS_BIND, None)?;
             set_readonly(p, true, false)?;
         }
 
@@ -634,12 +638,24 @@ fn enter(
     )
 }
 
+/// A path for overlay's option string, where `,` separates options and `:` separates lower layers.
+fn escape_opt(p: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &b in p.as_os_str().as_bytes() {
+        if matches!(b, b'\\' | b',' | b':') {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+    out
+}
+
 fn mount(
-    src: Option<&str>,
+    src: Option<&OsStr>,
     target: &Path,
     fstype: Option<&str>,
     flags: libc::c_ulong,
-    data: Option<&str>,
+    data: Option<&OsStr>,
 ) -> Result<(), String> {
     let src = src.map(cstr);
     let fstype = fstype.map(cstr);
