@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Works as a normal user (user namespace) and as root: `./test.sh` and `sudo ./test.sh`.
 set -euo pipefail
-OVENV=$(realpath "$(dirname "$0")/ovenv")
+OVENV=$(realpath "${OVENV_BIN:-$(dirname "$0")/target/release/ovenv}")
 T=$(mktemp -d "$HOME/.ovenv-test.XXXXXX")
 trap 'chmod -R u+rwx "$T"; rm -rf "$T"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }

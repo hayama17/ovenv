@@ -10,8 +10,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y attr
-      - run: shellcheck ovenv test.sh
+      - run: sudo apt-get install -y attr  # setfattr, used by the tests
+      - run: cargo fmt --check
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo build --release
+      - run: shellcheck test.sh
       # Ubuntu 24.04 blocks unprivileged user namespaces by default.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: user mode

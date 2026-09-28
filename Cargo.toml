@@ -1,0 +1,14 @@
+[package]
+name = "ovenv"
+version = "0.3.0"
+edition = "2021"
+description = "Stage a command's filesystem side effects in OverlayFS, then review, apply or discard them"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+sha2 = "0.10"
+similar = "2"
+
+[profile.release]
+strip = true
