@@ -12,7 +12,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ov() { "$OVENV" "$@"; }
 S=$T/sys
 
-mkdir -p "$T"/{proj/.ovenv,proj2/.ovenv,sys2,out,share} "$S"/{bin,d,pd,deldir,d2f}
+mkdir -p "$T"/{proj/.ovenv,proj2/.ovenv,skiponly/.ovenv,sys2,sys3,out,share} "$S"/{bin,d,pd,deldir,d2f}
 printf '%s\n' "$S" "rw $T/share" >"$T/proj/.ovenv/paths"
 echo "$T/sys2" >"$T/proj2/.ovenv/paths"
 cd "$S"
@@ -70,6 +70,10 @@ for want in "--- host:$S/conf" "+++ staged:$S/conf" "-old" "+new" \
 done
 ! grep -q /upper/ <<<"$out" || fail "diff --content exposes upper paths"
 
+err=$(ov apply --force 2>&1) && fail "apply went ahead with SKIP entries"
+grep -qxF "  $S/xa (xattrs)" <<<"$err" || fail "SKIP entries not listed: $err"
+[[ $(cat "$S/conf") == old && -f $U/xa ]] || fail "refused apply changed the host or dropped staged data"
+
 ov run sleep 2 & sleep 0.5
 ! ov run true 2>/dev/null || fail "second run allowed"
 ! ov shell </dev/null 2>/dev/null || fail "shell allowed during a run"
@@ -90,12 +94,12 @@ grep -qxF "  $S/hostgone" <<<"$err" || fail "host-side deletion not detected: $e
 ino_conf=$(stat -c %i "$S/conf"); ino_mode=$(stat -c %i "$S/mode"); mt=$(stat -c %Y "$S/touched")
 if [[ $EUID -ne 0 ]]; then
   chmod 000 "$U/conf"
-  ! ov apply --force 2>/dev/null || fail "apply succeeded with an unreadable staged file"
+  ! ov apply --force --drop-skipped 2>/dev/null || fail "apply succeeded with an unreadable staged file"
   [[ $(cat "$S/conf") == old && $(stat -c %i "$S/conf") == "$ino_conf" ]] || fail "failed copy touched the host file"
   [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left after failed copy"
   chmod 644 "$U/conf"
 fi
-ov apply --force
+ov apply --force --drop-skipped
 
 [[ $(cat "$S/conf") == new && $(stat -c %i "$S/conf") != "$ino_conf" ]] || fail "conf not replaced by rename"
 [[ $(cat "$S/conf2") == new && $(cat "$S/hostgone") == staged && $(cat "$S/bin/tool") == hi && ! -e $S/gone ]] || fail "apply content"
@@ -110,6 +114,15 @@ ov apply --force
 [[ $(stat -c %a "$S/xattr-mode") == 600 && $(getfattr --absolute-names --only-values -n user.ovenv_keep "$S/xattr-mode") == 1 ]] || fail "ATTR dropped an unchanged xattr"
 [[ -z $(find "$S" -name '.ovenv.*') ]] || fail "temp file left"
 [[ ! -e $ST && ! -e $T/proj/.ovenv/state && -f $T/proj/.ovenv/paths && -z $(ov diff) ]] || fail "not discarded after apply"
+
+# A session with nothing but a skipped directory keeps its staged files until --drop-skipped.
+cd "$T/skiponly"
+echo "$T/sys3" >.ovenv/paths
+ov run sh -c "mkdir $T/sys3/sd; setfattr -n user.ovenv_test -v 1 $T/sys3/sd; echo in > $T/sys3/sd/inner"
+inner=$(cat .ovenv/state)/upper$T/sys3/sd/inner
+! ov apply 2>/dev/null || fail "apply went ahead with only SKIP entries"
+[[ -f $inner && ! -e $T/sys3/sd ]] || fail "refused apply dropped staged files or changed the host"
+[[ $(ov apply --drop-skipped) == *"applied 0 change(s)" && ! -e $T/sys3/sd && -z $(ov diff) ]] || fail "--drop-skipped"
 
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home

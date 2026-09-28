@@ -33,7 +33,8 @@ ovenv init              create .ovenv/ in the current directory
 ovenv run <cmd>...      run a command with its writes staged
 ovenv shell             start $SHELL with writes staged
 ovenv diff [--content]  show staged changes (--content adds diff -u for MODIFY)
-ovenv apply [--force]   write staged changes to the host
+ovenv apply [--force] [--drop-skipped]
+                        write staged changes to the host
 ovenv discard           throw staged changes away
 ```
 
@@ -116,6 +117,9 @@ This does not catch everything:
 
 Regular files and symlinks are written to a temp file in the same directory and renamed into place,
 so an existing path never shows a half-written file or goes missing. If preparing the temp file fails, the original stays and the temp file is removed.
+If anything is listed as `SKIP`, apply stops before touching the host, because the staged copy is the only one.
+`--drop-skipped` applies the rest and discards the skipped entries.
+
 xattrs that are the same on the host and in staging are copied onto the new inode, and restored after an owner change (which clears file capabilities).
 If they can't be set, apply stops with the original file left in place.
 Because the rename creates a new inode, processes that already have the old file open keep reading the old content,
