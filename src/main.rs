@@ -427,23 +427,34 @@ fn enter(
         )?;
 
         // Grab the host's view of rw paths now, before an overlay above them would hide it.
-        let mut clones = Vec::new();
+        let mut clones = HashMap::new();
         for p in rw {
             if fs::symlink_metadata(p).is_ok() {
-                clones.push((open_tree(p)?, p));
+                clones.insert(p, open_tree(p)?);
             }
         }
 
-        // Overlay needs a writable upper at mount time, so mount before making everything read-only.
         let xopt = if env.mode == Mode::User {
             ",userxattr"
         } else {
             ""
         };
-        for p in ov {
+        // Outer paths first, so the inner one wins either way: a staged dir inside the project,
+        // or an rw dir inside a staged ~. Overlay needs a writable upper, so all this precedes the read-only step.
+        let mut order: Vec<(&PathBuf, bool)> = ov
+            .iter()
+            .map(|p| (p, false))
+            .chain(clones.keys().map(|p| (*p, true)))
+            .collect();
+        order.sort_by_key(|(p, is_rw)| (p.components().count(), *is_rw));
+        for (p, is_rw) in &order {
+            if *is_rw {
+                move_mount(&clones[p], p)?;
+                continue;
+            }
             let upper = env.upper(p);
             let work = under(&env.state().join("work"), p);
-            for d in [p, &upper, &work] {
+            for d in [*p, &upper, &work] {
                 fs::create_dir_all(d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
             }
             // ponytail: commas and colons in paths are not escaped in the overlay options (#6)
@@ -459,11 +470,7 @@ fn enter(
         set_readonly(Path::new("/"), true, true)?;
         set_readonly(Path::new("/proc"), false, true)?;
         set_readonly(Path::new("/dev"), false, true)?;
-        for p in ov {
-            set_readonly(p, false, false)?;
-        }
-        for (fd, p) in &clones {
-            move_mount(fd, p)?;
+        for (p, _) in &order {
             set_readonly(p, false, false)?;
         }
         // The command may read ovenv's own bookkeeping but must not change it.
