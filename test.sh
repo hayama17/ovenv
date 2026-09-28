@@ -148,6 +148,15 @@ grep -qxF "  $T/sys4" <<<"$err" || fail "deleted staged directory not reported: 
 [[ -d $(cat .ovenv/state) ]] || fail "refused apply dropped the staged state"
 ov discard
 
+# A staged path inside the project is staged, although the rest of the project writes through.
+mkdir -p "$T/pc/.ovenv" "$T/pc/sys"; echo old >"$T/pc/sys/f"
+echo "$T/pc/sys" >"$T/pc/.ovenv/paths"
+cd "$T/pc"
+ov run sh -c "echo new > $T/pc/sys/f; echo b > $T/pc/built"
+[[ $(cat "$T/pc/sys/f") == old && -e $T/pc/built ]] || fail "staged path inside the project wrote through"
+grep -qxF "MODIFY  $T/pc/sys/f" <<<"$(ov diff)" || fail "staged path inside the project not listed"
+ov discard
+
 # Staging ~: dotfiles are staged, a project under it is staged too, and rw still writes through.
 H=$T/home
 mkdir -p "$H/proj/.ovenv" "$H/direct"; echo orig >"$H/.bashrc"; chmod 700 "$H"
