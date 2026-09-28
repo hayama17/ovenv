@@ -161,6 +161,8 @@ discard() {
 
 apply() {
   local force=${1:-} base t p f h u
+  # without it, recreated directories are applied as merges and stale files stay on the host
+  command -v getfattr >/dev/null || die "apply needs getfattr (the attr package)"
   lock -xn
   base=$(cat "$D/base" 2>/dev/null || echo 0)
   local -a lines=() conflicts=()
