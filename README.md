@@ -116,6 +116,8 @@ This does not catch everything:
 
 Regular files and symlinks are written to a temp file in the same directory and renamed into place,
 so an existing path never shows a half-written file or goes missing. If preparing the temp file fails, the original stays and the temp file is removed.
+xattrs that are the same on the host and in staging are copied onto the new inode, and restored after an owner change (which clears file capabilities).
+If they can't be set, apply stops with the original file left in place.
 Because the rename creates a new inode, processes that already have the old file open keep reading the old content,
 and other hard links to the old file keep the old content.
 
