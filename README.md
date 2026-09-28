@@ -20,11 +20,11 @@ Everything else is mounted read-only, so a write outside the staged paths fails 
 ## Install
 
 ```sh
-git clone git@github.com:hayama17/ovenv.git ~/.local/share/ovenv
-ln -s ~/.local/share/ovenv/ovenv ~/.local/bin/ovenv
+cargo install --git ssh://git@github.com/hayama17/ovenv.git
+sudo install ~/.cargo/bin/ovenv /usr/local/bin/   # sudo's PATH usually skips ~/.cargo/bin
 ```
 
-Requires Linux 5.11+, util-linux 2.39+, GNU tar, and `getfattr` (the `attr` package).
+Requires Linux 5.12+. No other runtime dependencies.
 
 ## Usage
 
