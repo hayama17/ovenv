@@ -20,8 +20,8 @@ Everything else is mounted read-only, so a write outside the staged paths fails 
 ## Install
 
 ```sh
-curl -fsSLo ~/.local/bin/ovenv https://raw.githubusercontent.com/hayama17/ovenv/main/ovenv
-chmod +x ~/.local/bin/ovenv
+git clone git@github.com:hayama17/ovenv.git ~/.local/share/ovenv
+ln -s ~/.local/share/ovenv/ovenv ~/.local/bin/ovenv
 ```
 
 Requires Linux 5.11+, util-linux 2.39+, GNU tar, and `getfattr` (the `attr` package).
@@ -72,6 +72,8 @@ Everything else is read-only.
 | `REPLACE` | a directory was recreated, or a file and a directory swapped places |
 
 Files that were only touched are not listed.
+Paths are shown after symlinks are resolved, so they point at what actually changes on disk
+(on Arch, `make install` into `/usr/local/share/man` shows up under `/usr/local/man`).
 
 ### Apply
 
