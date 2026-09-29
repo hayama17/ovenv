@@ -37,6 +37,10 @@ pub(crate) fn describe(p: &Path) -> String {
 }
 
 pub(crate) fn show_diff(env: &Env, content: bool) {
+    // the host is part-way through an apply, so a diff against it would mislead
+    if crate::journal::interrupted(env) {
+        die!("an apply was interrupted; rerun `ovenv apply` to roll it back or finish it");
+    }
     let list = changes(env);
     if list.is_empty() {
         return;

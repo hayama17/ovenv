@@ -144,14 +144,20 @@ This does not catch everything:
 - Because the rename creates a new inode, processes that already have the old file open keep reading the old content, and other hard links to the old file keep the old content.
 - Staged files that can't be read stop apply before anything reaches the host.
 
-This is per file only. Apply as a whole is not atomic, nothing is fsynced, and deletions and directory replacements are plain `rm` and `mkdir`.
-If apply fails halfway, some changes are already on the host; staged changes are kept, so fix the cause and rerun it (with `--force` if it flags what it already applied).
+Apply as a whole is all or nothing:
+
+- Each step is recorded in `.ovenv/journal` before it touches the host. Replaced and deleted paths are moved aside (`.ovenv-old.<random>` next to them) or, for modified files, hard-linked there, and only removed once everything is written.
+- If a step fails, apply undoes the steps before it and stops with the host unchanged and the staged changes kept.
+- If apply is killed or the machine goes down, the next `run`, `apply` or `discard` rolls it back, or finishes it if it had already committed. `diff` refuses until then.
+- New contents are synced to disk before the commit, so a finished apply survives a crash.
+
+Modified files need hard links in their directory; on a filesystem without them, apply fails and rolls back.
 
 ## Where state lives
 
 | Where | What |
 | --- | --- |
-| `.ovenv/` | `paths`, the mode, a lock, and `state` pointing at the state directory |
+| `.ovenv/` | `paths`, the mode, a lock, `state` pointing at the state directory, and `journal` while an apply runs |
 | `/var/tmp/ovenv-<random>/` | staged changes (upper and work layers), the recorded host state and the staged path list; mode 700 |
 
 Keeping staged changes outside the project lets you stage the directory `.ovenv/` lives in, including all of `~`.

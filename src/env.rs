@@ -329,6 +329,7 @@ pub(crate) fn lock(env: &Env) -> File {
         );
     }
     check_session(env);
+    crate::journal::recover(env);
     f
 }
 

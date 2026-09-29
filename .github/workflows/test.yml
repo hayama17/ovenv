@@ -14,6 +14,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --release -- -D warnings
       - run: cargo build --release
+      - run: cargo test --release
       - run: shellcheck test.sh
       # Ubuntu 24.04 blocks unprivileged user namespaces by default.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
