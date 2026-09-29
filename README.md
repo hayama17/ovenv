@@ -9,7 +9,7 @@ ADD     /usr/local/bin/foo
 ADD     /usr/local/lib/libfoo.so
 ADD     /usr/local/share/man/man1/foo.1
 
-2.1M staged
+2.1M staged in /var/tmp/ovenv-Xq3vT9kA
 $ sudo ovenv apply      # or: sudo ovenv discard
 ```
 
@@ -80,7 +80,7 @@ Relative paths are relative to the project, wherever you run ovenv from.
 
 Without `.ovenv/paths`, and in the file `ovenv init` writes:
 
-- **Root mode** (`sudo`): `/usr /opt /etc /var /root` and `rw .`
+- **Root mode** (`sudo`): `/usr /opt /etc /var/lib /var/cache /var/log /var/spool /var/opt /root`, `rw /var/tmp` and `rw .`
 - **User mode** (no `sudo`): `~/.local ~/.cargo ~/.npm ~/.cache ~/.config` and `rw .`. ovenv uses a user namespace, and commands still run as you. It can't stage paths owned by other users.
 
 An `.ovenv/` sticks to the mode it was created in.
@@ -96,7 +96,7 @@ A missing `rw` path is not created either, and `run` warns about it.
 The staged paths are fixed when staging starts. Editing `.ovenv/paths` takes effect after `apply` or `discard`, and `run` warns if it changed.
 
 Unix sockets can't be reached through an overlay, so pass through directories that hold them (`rw ~/.gnupg` for gpg-agent).
-`/tmp` and `/` can't be staged, since the state directory lives in `/tmp`.
+`/` can't be staged, nor `/var` and `/tmp` together, since the state directory has to live outside every staged path.
 
 ## Reading the diff
 
@@ -152,10 +152,12 @@ If apply fails halfway, some changes are already on the host; staged changes are
 | Where | What |
 | --- | --- |
 | `.ovenv/` | `paths`, the mode, a lock, and `state` pointing at the state directory |
-| `/tmp/ovenv-<random>/` | staged changes (upper and work layers), the recorded host state and the staged path list; mode 700 |
+| `/var/tmp/ovenv-<random>/` | staged changes (upper and work layers), the recorded host state and the staged path list; mode 700 |
 
 Keeping staged changes outside the project lets you stage the directory `.ovenv/` lives in, including all of `~`.
-They don't survive a reboot: if the state directory is gone, `diff`, `apply` and `run` stop with an error, and `discard` resets.
+`/var/tmp` survives a reboot, but systemd-tmpfiles removes files there that go unused for 30 days on most distros, so apply or discard before then.
+If `/var/tmp` is staged, the state goes to `/tmp` instead and is lost on reboot; `run` warns and `diff` says so.
+If the state directory is gone, `diff`, `apply` and `run` stop with an error, and `discard` resets.
 `apply` and `discard` remove the state directory and keep `.ovenv/paths`.
 
 ## Limits

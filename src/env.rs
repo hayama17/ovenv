@@ -13,7 +13,20 @@ use std::path::{Component, Path, PathBuf};
 use crate::files::{is_dir, lstat};
 use crate::or_die;
 
-pub(crate) const ROOT_DEFAULT: &[&str] = &["/usr", "/opt", "/etc", "/var", "/root", "rw ."];
+// /var itself stays unstaged so the state directory can live in /var/tmp.
+pub(crate) const ROOT_DEFAULT: &[&str] = &[
+    "/usr",
+    "/opt",
+    "/etc",
+    "/var/lib",
+    "/var/cache",
+    "/var/log",
+    "/var/spool",
+    "/var/opt",
+    "/root",
+    "rw /var/tmp",
+    "rw .",
+];
 
 pub(crate) const USER_DEFAULT: &[&str] = &[
     "~/.local",
@@ -35,7 +48,7 @@ pub(crate) struct Env {
     pub(crate) dir: PathBuf,
     pub(crate) project: PathBuf,
     pub(crate) mode: Mode,
-    /// /tmp/ovenv-*/: upper, work and base
+    /// /var/tmp/ovenv-*/ (or /tmp/ovenv-*/): upper, work and base
     pub(crate) state: Option<PathBuf>,
 }
 
@@ -196,10 +209,15 @@ impl Env {
     }
 }
 
+/// /var/tmp survives a reboot; /tmp is the fallback when /var/tmp is staged.
+const STATE_BASES: [&str; 2] = ["/var/tmp", "/tmp"];
+
 /// The state directory holds staged file contents, so refuse anything we didn't create for ourselves.
 pub(crate) fn check_state(st: &Path) {
     let m = lstat(st);
-    let ok = st.parent() == Some(Path::new("/tmp"))
+    let ok = st
+        .parent()
+        .is_some_and(|d| STATE_BASES.iter().any(|b| d == Path::new(b)))
         && st
             .file_name()
             .is_some_and(|n| n.as_bytes().starts_with(b"ovenv-"))
@@ -208,18 +226,29 @@ pub(crate) fn check_state(st: &Path) {
         });
     if !ok {
         die!(
-            "refusing to use {}: expected a /tmp/ovenv-* directory owned by you with mode 700",
+            "refusing to use {}: expected a /var/tmp/ovenv-* or /tmp/ovenv-* directory owned by you with mode 700",
             st.display()
         );
     }
 }
 
 pub(crate) fn create_state(env: &mut Env) {
-    let mut tmpl = b"/tmp/ovenv-XXXXXXXX\0".to_vec();
+    // The state can't sit under a staged path, since overlay refuses an upper inside its lower.
+    let staged = env.wanted_overlays(false);
+    let base = STATE_BASES
+        .into_iter()
+        .find(|b| !staged.iter().any(|p| Path::new(b).starts_with(p)))
+        .unwrap_or("/tmp");
+    if base == "/tmp" {
+        eprintln!(
+            "ovenv: /var/tmp is staged, so staged changes go to /tmp and won't survive a reboot"
+        );
+    }
+    let mut tmpl = format!("{base}/ovenv-XXXXXXXX\0").into_bytes();
     // mkdtemp picks an unguessable name and creates it with mode 700
     if unsafe { libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) }.is_null() {
         die!(
-            "cannot create a state directory in /tmp: {}",
+            "cannot create a state directory in {base}: {}",
             io::Error::last_os_error()
         );
     }

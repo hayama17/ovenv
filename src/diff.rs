@@ -61,7 +61,17 @@ pub(crate) fn show_diff(env: &Env, content: bool) {
         .filter_map(|r| lstat(&env.state().join("upper").join(r)))
         .map(|m| m.blocks() * 512)
         .sum();
-    let _ = writeln!(out, "\n{} staged", human(staged));
+    let _ = writeln!(
+        out,
+        "\n{} staged in {}{}",
+        human(staged),
+        env.state().display(),
+        if env.state().starts_with("/tmp") {
+            " (lost on reboot)"
+        } else {
+            ""
+        }
+    );
     if !content {
         return;
     }
