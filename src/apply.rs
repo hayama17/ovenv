@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::baseline::{host_state, read_base};
 use crate::changes::{changes, Change, Kind};
 use crate::env::{lock, Env, Mode};
-use crate::files::{copy_xattrs, hex, is_dir, lstat, unlock_tree};
+use crate::files::{copy_xattrs, hex, is_dir, lstat, sync_path, unlock_tree};
 use crate::journal::{Journal, Step};
 use crate::or_die;
 
@@ -81,7 +81,10 @@ fn set_aside(j: &mut Journal, h: &Path) -> Result<(), String> {
         host: h.to_path_buf(),
         old: old.clone(),
     }])?;
-    fs::rename(h, &old).map_err(|e| format!("cannot move {} aside: {e}", h.display()))
+    fs::rename(h, &old).map_err(|e| format!("cannot move {} aside: {e}", h.display()))?;
+    // Later steps' rollback assumes the original is out of the way, even after a power loss.
+    sync_path(h.parent().unwrap_or(Path::new("/")));
+    Ok(())
 }
 
 /// Put a copy of regular file or symlink `up` at `h` with rename(2), so an existing `h` is never missing or half-written.
@@ -101,6 +104,7 @@ fn put(env: &Env, j: &mut Journal, up: &Path, h: &Path) -> Result<(), String> {
     if let Some(old) = &keep {
         // ponytail: needs hard links in the target dir; copy the old file instead if a filesystem lacks them
         fs::hard_link(h, old).map_err(|e| format!("cannot keep the old {}: {e}", h.display()))?;
+        sync_path(h.parent().unwrap_or(Path::new("/")));
     }
     fs::rename(&tmp, h).map_err(|e| format!("cannot replace {}: {e}", h.display()))
 }

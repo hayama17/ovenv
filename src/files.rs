@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 use crate::env::Env;
 use crate::sys::cstr;
 
+/// fsync `p` (a directory, for renames and removals in it), or everything when it can't be opened.
+pub(crate) fn sync_path(p: &Path) {
+    if File::open(p).and_then(|f| f.sync_all()).is_err() {
+        // SAFETY: sync(2) takes no arguments and cannot fail.
+        unsafe { libc::sync() };
+    }
+}
+
 pub(crate) fn lstat(p: &Path) -> Option<Metadata> {
     fs::symlink_metadata(p).ok()
 }

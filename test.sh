@@ -296,6 +296,26 @@ err=$(ov discard 2>&1) && fail "finishing a committed apply didn't say so"
 grep -q "finished an interrupted apply" <<<"$err" || fail "no finish notice: $err"
 [[ $(cat "$T/sysj/f") == old && ! -e $T/sysj/.ovenv-old.y && ! -e .ovenv/journal ]] || fail "committed apply not finished"
 
+# A rollback cut short resumes where it stopped: redoing the Adds would delete the restored original dir.
+mkdir -p "$T/sysj/d"; echo orig >"$T/sysj/d/x"
+printf 'keep\0%s\0%s\0add\0%s\0add\0%s\0undone\0undone\0undone\0' \
+  "$T/sysj/d" "$T/sysj/.ovenv-old.d" "$T/sysj/d" "$T/sysj/d/x" >.ovenv/journal
+ov discard 2>/dev/null || fail "discard after a finished rollback"
+[[ $(cat "$T/sysj/d/x") == orig ]] || fail "replayed rollback deleted the restored dir"
+mv "$T/sysj/d" "$T/sysj/.ovenv-old.d"
+printf 'keep\0%s\0%s\0add\0%s\0add\0%s\0undone\0undone\0' \
+  "$T/sysj/d" "$T/sysj/.ovenv-old.d" "$T/sysj/d" "$T/sysj/d/x" >.ovenv/journal
+ov discard 2>/dev/null || fail "discard after a half-done rollback"
+[[ $(cat "$T/sysj/d/x") == orig && ! -e $T/sysj/.ovenv-old.d ]] || fail "half-done rollback not resumed"
+
+# A committed apply that got as far as removing the state dir is still finished by apply.
+ov run true
+st=$(cat .ovenv/state); chmod -R u+rwx "$st"; rm -rf "$st"
+printf 'commit\0' >.ovenv/journal
+err=$(ov apply 2>&1) && fail "apply over a committed journal didn't stop"
+grep -q "finished an interrupted apply" <<<"$err" || fail "committed journal not finished by apply: $err"
+[[ ! -e .ovenv/journal && ! -e .ovenv/state ]] || fail "committed journal or state left behind"
+
 # Staging /var/tmp moves the state to /tmp, with a warning.
 mkdir -p "$T/fallback/.ovenv"; cd "$T/fallback"
 echo /var/tmp >.ovenv/paths

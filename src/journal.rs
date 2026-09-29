@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::apply::{discard_files, remove};
 use crate::env::{Env, Mode};
-use crate::files::{hex, is_dir, lstat, set_xattrs, unlock_tree, xattrs};
+use crate::files::{hex, is_dir, lstat, set_xattrs, sync_path, unlock_tree, xattrs};
 use crate::or_die;
 
 pub(crate) enum Step {
@@ -138,8 +138,9 @@ impl Step {
     }
 }
 
-/// Parse a journal; a record cut short by a crash is dropped, since its step never started.
-fn parse(data: &[u8]) -> (Vec<Step>, bool) {
+/// Parse a journal into its steps, whether it committed, and how many steps rollback already undid.
+/// A record cut short by a crash is dropped, since its step never started.
+fn parse(data: &[u8]) -> (Vec<Step>, bool, usize) {
     let mut tok = data.split(|&b| b == 0);
     // the piece after the last NUL is incomplete (or empty)
     let complete = data.iter().filter(|&&b| b == 0).count();
@@ -155,10 +156,15 @@ fn parse(data: &[u8]) -> (Vec<Step>, bool) {
     let num = |b: &[u8]| std::str::from_utf8(b).ok()?.parse::<u32>().ok();
     let mut steps = Vec::new();
     let mut committed = false;
+    let mut undone = 0;
     while let Some(op) = next() {
         let step = match op {
             b"commit" => {
                 committed = true;
+                continue;
+            }
+            b"undone" => {
+                undone += 1;
                 continue;
             }
             b"temp" => next().map(|p| Step::Temp(path(p))),
@@ -195,7 +201,7 @@ fn parse(data: &[u8]) -> (Vec<Step>, bool) {
             None => break,
         }
     }
-    (steps, committed)
+    (steps, committed, undone)
 }
 
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
@@ -208,6 +214,8 @@ pub(crate) struct Journal {
     path: PathBuf,
     f: File,
     steps: Vec<Step>,
+    /// how many of the newest steps rollback has undone
+    undone: usize,
 }
 
 impl Journal {
@@ -225,7 +233,35 @@ impl Journal {
             path,
             f,
             steps: Vec::new(),
+            undone: 0,
         })
+    }
+
+    /// The journal an interrupted apply left, and whether it had committed.
+    fn open(env: &Env) -> Option<(Journal, bool)> {
+        let path = env.dir.join("journal");
+        let data = fs::read(&path).ok()?;
+        let (steps, committed, undone) = parse(&data);
+        let f = or_die(
+            OpenOptions::new().append(true).open(&path),
+            format!("cannot open {}", path.display()),
+        );
+        Some((
+            Journal {
+                path,
+                f,
+                steps,
+                undone,
+            },
+            committed,
+        ))
+    }
+
+    fn append(&mut self, buf: &[u8]) -> Result<(), String> {
+        self.f
+            .write_all(buf)
+            .and_then(|()| self.f.sync_data())
+            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
     }
 
     /// Record steps durably; only then may they touch the host.
@@ -237,47 +273,52 @@ impl Journal {
         for s in &self.steps[start..] {
             s.encode(&mut buf);
         }
-        self.f
-            .write_all(&buf)
-            .and_then(|()| self.f.sync_data())
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+        self.append(&buf)
     }
 
-    pub(crate) fn rollback(self, env: &Env) -> Result<(), String> {
-        undo_all(env, &self.steps)?;
-        fs::remove_file(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))
+    /// Undo steps newest first. Each undo is synced and then marked, so a rollback cut short resumes
+    /// where it stopped instead of undoing an earlier step on top of what it already restored.
+    pub(crate) fn rollback(mut self, env: &Env) -> Result<(), String> {
+        while self.undone < self.steps.len() {
+            let s = &self.steps[self.steps.len() - 1 - self.undone];
+            s.undo(env)
+                .map_err(|e| format!("cannot roll back {}: {e}", target(s)))?;
+            match s {
+                Step::Attr { host, .. } => sync_path(host),
+                Step::Temp(p) | Step::Add(p) | Step::Keep { host: p, .. } => {
+                    sync_path(p.parent().unwrap_or(Path::new("/")))
+                }
+            }
+            self.append(b"undone\0")?;
+            self.undone += 1;
+        }
+        self.remove()
     }
 
-    /// Commit, clean up, and drop the staged state. The journal goes last, so a crash in between
-    /// is finished by recover() instead of leaving applied changes staged.
+    /// Commit and finish. New contents only need to be on disk once rollback is no longer possible.
     pub(crate) fn commit(mut self, env: &Env) -> Result<(), String> {
-        // New contents only need to be on disk once rollback is no longer possible.
         // SAFETY: sync(2) takes no arguments and cannot fail.
         unsafe { libc::sync() };
-        self.f
-            .write_all(b"commit\0")
-            .and_then(|()| self.f.sync_data())
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
-        finish_all(&self.steps)?;
+        self.append(b"commit\0")?;
+        self.finish(env)
+    }
+
+    /// Remove the backups and the staged state. The journal goes last, so a crash in between is
+    /// finished by recover() instead of leaving applied changes staged.
+    fn finish(self, env: &Env) -> Result<(), String> {
+        for s in &self.steps {
+            s.finish()
+                .map_err(|e| format!("cannot clean up {}: {e}", target(s)))?;
+        }
         discard_files(env);
-        fs::remove_file(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))
+        self.remove()
     }
-}
 
-fn undo_all(env: &Env, steps: &[Step]) -> Result<(), String> {
-    for s in steps.iter().rev() {
-        s.undo(env)
-            .map_err(|e| format!("cannot roll back {}: {e}", target(s)))?;
+    fn remove(self) -> Result<(), String> {
+        fs::remove_file(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+        sync_path(self.path.parent().unwrap_or(Path::new("/")));
+        Ok(())
     }
-    Ok(())
-}
-
-fn finish_all(steps: &[Step]) -> Result<(), String> {
-    for s in steps {
-        s.finish()
-            .map_err(|e| format!("cannot clean up {}: {e}", target(s)))?;
-    }
-    Ok(())
 }
 
 fn target(s: &Step) -> std::path::Display<'_> {
@@ -289,13 +330,14 @@ fn target(s: &Step) -> std::path::Display<'_> {
 
 /// Settle an apply that was interrupted: roll it back, or finish it if it had committed.
 pub(crate) fn recover(env: &Env) {
-    let path = env.dir.join("journal");
-    let Ok(data) = fs::read(&path) else { return };
-    let (steps, committed) = parse(&data);
+    let Some((j, committed)) = Journal::open(env) else {
+        return;
+    };
+    let path = j.path.clone();
     let r = if committed {
-        finish_all(&steps)
+        j.finish(env)
     } else {
-        undo_all(env, &steps)
+        j.rollback(env)
     };
     if let Err(e) = r {
         die!(
@@ -303,13 +345,6 @@ pub(crate) fn recover(env: &Env) {
             path.display()
         );
     }
-    if committed {
-        discard_files(env);
-    }
-    or_die(
-        fs::remove_file(&path),
-        format!("cannot remove {}", path.display()),
-    );
     if committed {
         die!("finished an interrupted apply; its changes are on the host");
     }
@@ -344,8 +379,8 @@ mod tests {
         for s in &steps {
             s.encode(&mut buf);
         }
-        let (got, committed) = parse(&buf);
-        assert!(!committed);
+        let (got, committed, undone) = parse(&buf);
+        assert!(!committed && undone == 0);
         assert_eq!(got.len(), 3);
         match &got[2] {
             Step::Attr { mode, xattrs, .. } => {
@@ -357,6 +392,8 @@ mod tests {
         // a record cut mid-way is dropped
         let cut = buf.len() - 3;
         assert_eq!(parse(&buf[..cut]).0.len(), 2);
+        buf.extend_from_slice(b"undone\0undone\0");
+        assert_eq!(parse(&buf).2, 2);
         buf.extend_from_slice(b"commit\0");
         assert!(parse(&buf).1);
     }

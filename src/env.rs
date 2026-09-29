@@ -87,7 +87,8 @@ impl Env {
         if let Some(st) = &state {
             if lstat(st).is_some() {
                 check_state(st);
-            } else if !allow_gone {
+            // recover() under the lock settles an interrupted apply, which may have removed it
+            } else if !allow_gone && lstat(&dir.join("journal")).is_none() {
                 die!(
                     "staged changes in {} are gone (e.g. after a reboot); run `ovenv discard` to start over",
                     st.display()
