@@ -44,7 +44,7 @@ ov run sh -c "
 "
 ST=$(cat "$T/proj/.ovenv/state")
 U=$ST/upper$S
-[[ $ST == /tmp/ovenv-* && $(stat -c %a:%u "$ST") == "700:$(id -u)" ]] || fail "state dir: $ST $(stat -c %a:%u "$ST")"
+[[ $ST == /var/tmp/ovenv-* && $(stat -c %a:%u "$ST") == "700:$(id -u)" ]] || fail "state dir: $ST $(stat -c %a:%u "$ST")"
 [[ ! -e $T/proj/ovenv-writable && ! -e $T/proj/state-writable ]] || fail ".ovenv or the state dir was writable inside"
 
 [[ $(cat "$S/conf") == old && ! -e $S/bin/tool && -e $S/gone && -e $S/d/old ]] || fail "host changed"
@@ -263,4 +263,12 @@ for c in diff apply "run true"; do
 done
 ov discard
 [[ ! -e .ovenv/state && -f .ovenv/paths && -z $(ov diff) ]] || fail "discard after a missing state dir"
+
+# Staging /var/tmp moves the state to /tmp, with a warning.
+mkdir -p "$T/fallback/.ovenv"; cd "$T/fallback"
+echo /var/tmp >.ovenv/paths
+err=$(ov run true 2>&1) || fail "run with /var/tmp staged: $err"
+[[ $(cat .ovenv/state) == /tmp/ovenv-* ]] || fail "state not in /tmp: $(cat .ovenv/state)"
+grep -q "won't survive a reboot" <<<"$err" || fail "no fallback warning: $err"
+ov discard
 echo OK
