@@ -1,6 +1,7 @@
 //! apply's write-ahead journal. Each step is recorded before it touches the host, so a failed or
 //! interrupted apply rolls back to the host as it was, and one that got as far as `commit` is finished.
 
+use std::cell::Cell;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -138,33 +139,39 @@ impl Step {
     }
 }
 
-/// Parse a journal into its steps, whether it committed, and how many steps rollback already undid.
-/// A record cut short by a crash is dropped, since its step never started.
-fn parse(data: &[u8]) -> (Vec<Step>, bool, usize) {
+/// Parse a journal into its steps, whether it committed, how many steps rollback already undid,
+/// and the length of its complete records. A record cut short by a crash is dropped, since its step never started.
+fn parse(data: &[u8]) -> (Vec<Step>, bool, usize, usize) {
     let mut tok = data.split(|&b| b == 0);
     // the piece after the last NUL is incomplete (or empty)
     let complete = data.iter().filter(|&&b| b == 0).count();
     let mut left = complete;
+    let pos = Cell::new(0);
     let mut next = || {
         if left == 0 {
             return None;
         }
         left -= 1;
-        tok.next()
+        let t = tok.next()?;
+        pos.set(pos.get() + t.len() + 1);
+        Some(t)
     };
     let path = |b: &[u8]| PathBuf::from(OsStr::from_bytes(b));
     let num = |b: &[u8]| std::str::from_utf8(b).ok()?.parse::<u32>().ok();
     let mut steps = Vec::new();
     let mut committed = false;
     let mut undone = 0;
+    let mut valid = 0;
     while let Some(op) = next() {
         let step = match op {
             b"commit" => {
                 committed = true;
+                valid = pos.get();
                 continue;
             }
             b"undone" => {
                 undone += 1;
+                valid = pos.get();
                 continue;
             }
             b"temp" => next().map(|p| Step::Temp(path(p))),
@@ -197,11 +204,14 @@ fn parse(data: &[u8]) -> (Vec<Step>, bool, usize) {
             _ => None,
         };
         match step {
-            Some(s) => steps.push(s),
+            Some(s) => {
+                steps.push(s);
+                valid = pos.get();
+            }
             None => break,
         }
     }
-    (steps, committed, undone)
+    (steps, committed, undone, valid)
 }
 
 fn unhex(s: &[u8]) -> Option<Vec<u8>> {
@@ -241,10 +251,15 @@ impl Journal {
     fn open(env: &Env) -> Option<(Journal, bool)> {
         let path = env.dir.join("journal");
         let data = fs::read(&path).ok()?;
-        let (steps, committed, undone) = parse(&data);
+        let (steps, committed, undone, valid) = parse(&data);
         let f = or_die(
             OpenOptions::new().append(true).open(&path),
             format!("cannot open {}", path.display()),
+        );
+        // Drop a torn tail, or the markers rollback appends would join it and be lost.
+        or_die(
+            f.set_len(valid as u64).and_then(|()| f.sync_data()),
+            format!("cannot truncate {}", path.display()),
         );
         Some((
             Journal {
@@ -311,6 +326,8 @@ impl Journal {
                 .map_err(|e| format!("cannot clean up {}: {e}", target(s)))?;
         }
         discard_files(env);
+        // SAFETY: sync(2) takes no arguments and cannot fail.
+        unsafe { libc::sync() };
         self.remove()
     }
 
@@ -379,8 +396,8 @@ mod tests {
         for s in &steps {
             s.encode(&mut buf);
         }
-        let (got, committed, undone) = parse(&buf);
-        assert!(!committed && undone == 0);
+        let (got, committed, undone, valid) = parse(&buf);
+        assert!(!committed && undone == 0 && valid == buf.len());
         assert_eq!(got.len(), 3);
         match &got[2] {
             Step::Attr { mode, xattrs, .. } => {
@@ -391,7 +408,12 @@ mod tests {
         }
         // a record cut mid-way is dropped
         let cut = buf.len() - 3;
-        assert_eq!(parse(&buf[..cut]).0.len(), 2);
+        let (got, _, _, valid) = parse(&buf[..cut]);
+        assert_eq!(got.len(), 2);
+        // a marker appended after truncating the torn tail is read back
+        let mut torn = buf[..valid].to_vec();
+        torn.extend_from_slice(b"undone\0");
+        assert_eq!(parse(&torn).2, 1);
         buf.extend_from_slice(b"undone\0undone\0");
         assert_eq!(parse(&buf).2, 2);
         buf.extend_from_slice(b"commit\0");
