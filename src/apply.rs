@@ -175,7 +175,7 @@ pub(crate) fn apply(env: &Env, force: bool, drop_skipped: bool) {
 
     let mut j = Journal::create(env).unwrap_or_else(|e| die!("{e}"));
     let mut skipped = Vec::new();
-    if let Err(e) = write_all(env, &mut j, &list, &mut skipped) {
+    if let Err(e) = write_all(env, &mut j, &list, &mut skipped).and_then(|()| j.sync_host()) {
         match j.rollback(env) {
             Ok(()) => die!("{e}; rolled back, the host is unchanged"),
             Err(r) => die!("{e}; {r}; fix it and rerun ovenv to finish the rollback"),

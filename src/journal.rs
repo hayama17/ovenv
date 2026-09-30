@@ -2,11 +2,13 @@
 //! interrupted apply rolls back to the host as it was, and one that got as far as `commit` is finished.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{lchown, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -43,6 +45,13 @@ impl Step {
             gid: m.gid(),
             xattrs: xattrs(host),
         })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Step::Temp(p) | Step::Add(p) => p,
+            Step::Keep { host, .. } | Step::Attr { host, .. } => host,
+        }
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
@@ -226,6 +235,10 @@ pub(crate) struct Journal {
     steps: Vec<Step>,
     /// how many of the newest steps rollback has undone
     undone: usize,
+    /// length of the complete records, which is where the next one goes
+    len: u64,
+    /// a failed write couldn't be cut back off, so appending more would join a torn record
+    torn: bool,
 }
 
 impl Journal {
@@ -244,6 +257,8 @@ impl Journal {
             f,
             steps: Vec::new(),
             undone: 0,
+            len: 0,
+            torn: false,
         })
     }
 
@@ -267,16 +282,27 @@ impl Journal {
                 f,
                 steps,
                 undone,
+                len: valid as u64,
+                torn: false,
             },
             committed,
         ))
     }
 
     fn append(&mut self, buf: &[u8]) -> Result<(), String> {
-        self.f
-            .write_all(buf)
-            .and_then(|()| self.f.sync_data())
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
+        if self.torn {
+            return Err(format!("{} has a torn record", self.path.display()));
+        }
+        if let Err(e) = self.f.write_all(buf).and_then(|()| self.f.sync_data()) {
+            self.torn = self
+                .f
+                .set_len(self.len)
+                .and_then(|()| self.f.sync_data())
+                .is_err();
+            return Err(format!("cannot write {}: {e}", self.path.display()));
+        }
+        self.len += buf.len() as u64;
+        Ok(())
     }
 
     /// Record steps durably; only then may they touch the host.
@@ -288,7 +314,12 @@ impl Journal {
         for s in &self.steps[start..] {
             s.encode(&mut buf);
         }
-        self.append(&buf)
+        let r = self.append(&buf);
+        if r.is_err() {
+            // not on disk, so not taken
+            self.steps.truncate(start);
+        }
+        r
     }
 
     /// Undo steps newest first. Each undo is synced and then marked, so a rollback cut short resumes
@@ -310,10 +341,26 @@ impl Journal {
         self.remove()
     }
 
-    /// Commit and finish. New contents only need to be on disk once rollback is no longer possible.
+    /// Flush every filesystem apply wrote to, failing on a writeback error: commit drops the backups,
+    /// so new contents must be on disk first. An unseen writeback error is reported to a new fd too.
+    pub(crate) fn sync_host(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for s in &self.steps {
+            let dir = s.path().parent().unwrap_or(Path::new("/"));
+            let fail = |e: io::Error| format!("cannot sync {}: {e}", dir.display());
+            let d = File::open(dir).map_err(fail)?;
+            if seen.insert(d.metadata().map_err(fail)?.dev()) {
+                // SAFETY: d is an open fd for the duration of the call.
+                if unsafe { libc::syncfs(d.as_raw_fd()) } != 0 {
+                    return Err(fail(io::Error::last_os_error()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit and finish; call sync_host() first.
     pub(crate) fn commit(mut self, env: &Env) -> Result<(), String> {
-        // SAFETY: sync(2) takes no arguments and cannot fail.
-        unsafe { libc::sync() };
         self.append(b"commit\0")?;
         self.finish(env)
     }
@@ -339,10 +386,7 @@ impl Journal {
 }
 
 fn target(s: &Step) -> std::path::Display<'_> {
-    match s {
-        Step::Temp(p) | Step::Add(p) => p.display(),
-        Step::Keep { host, .. } | Step::Attr { host, .. } => host.display(),
-    }
+    s.path().display()
 }
 
 /// Settle an apply that was interrupted: roll it back, or finish it if it had committed.
