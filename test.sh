@@ -264,6 +264,58 @@ done
 ov discard
 [[ ! -e .ovenv/state && -f .ovenv/paths && -z $(ov diff) ]] || fail "discard after a missing state dir"
 
+# A failing apply rolls back what it already did. zz sorts last and is locked on the host.
+mkdir -p "$T/rb/.ovenv" "$T/sysr/d" "$T/sysr/zz"; echo "$T/sysr" >"$T/rb/.ovenv/paths"
+echo old >"$T/sysr/a"; echo gone >"$T/sysr/g"; echo old >"$T/sysr/zz/f"; chmod 755 "$T/sysr/d"
+cd "$T/rb"
+ov run sh -c "cd $T/sysr; echo new >a; rm g; chmod 700 d; mkdir n; echo n >n/f; echo new >zz/f"
+lockdir() { if [[ $EUID -eq 0 ]]; then chattr "$1i" "$2"; else chmod "$([[ $1 == + ]] && echo 555 || echo 755)" "$2"; fi; }
+lockdir + "$T/sysr/zz"
+err=$(ov apply --force 2>&1) && fail "apply into a locked dir succeeded"
+lockdir - "$T/sysr/zz"
+grep -q "rolled back, the host is unchanged" <<<"$err" || fail "no rollback: $err"
+[[ $(cat "$T/sysr/a") == old && $(cat "$T/sysr/g") == gone && ! -e $T/sysr/n && $(stat -c %a "$T/sysr/d") == 755 ]] || fail "rollback left changes"
+[[ -z $(find "$T/sysr" -name '.ovenv*') && ! -e .ovenv/journal ]] || fail "rollback left temp files or the journal"
+grep -qxF "MODIFY  $T/sysr/a" <<<"$(ov diff)" || fail "rollback dropped the staged changes"
+ov apply --force >/dev/null
+[[ $(cat "$T/sysr/a") == new && $(cat "$T/sysr/zz/f") == new && -z $(find "$T/sysr" -name '.ovenv*') ]] || fail "apply after rollback"
+
+# An apply cut off before its commit is rolled back by the next command; one cut off after it is finished.
+mkdir -p "$T/jr/.ovenv" "$T/sysj"; echo "$T/sysj" >"$T/jr/.ovenv/paths"
+cd "$T/jr"
+echo new >"$T/sysj/f"; echo old >"$T/sysj/.ovenv-old.x"; echo n >"$T/sysj/added"
+printf 'keep\0%s\0%s\0add\0%s\0ke' "$T/sysj/f" "$T/sysj/.ovenv-old.x" "$T/sysj/added" >.ovenv/journal
+err=$(ov diff 2>&1) && fail "diff ran over an interrupted apply"
+grep -q "interrupted" <<<"$err" || fail "unclear interrupted-apply error: $err"
+err=$(ov discard 2>&1) || fail "discard after an interrupted apply: $err"
+grep -q "rolled back an interrupted apply" <<<"$err" || fail "no rollback notice: $err"
+[[ $(cat "$T/sysj/f") == old && ! -e $T/sysj/.ovenv-old.x && ! -e $T/sysj/added && ! -e .ovenv/journal ]] || fail "interrupted apply not rolled back"
+echo old2 >"$T/sysj/.ovenv-old.y"
+printf 'keep\0%s\0%s\0commit\0' "$T/sysj/f" "$T/sysj/.ovenv-old.y" >.ovenv/journal
+err=$(ov discard 2>&1) && fail "finishing a committed apply didn't say so"
+grep -q "finished an interrupted apply" <<<"$err" || fail "no finish notice: $err"
+[[ $(cat "$T/sysj/f") == old && ! -e $T/sysj/.ovenv-old.y && ! -e .ovenv/journal ]] || fail "committed apply not finished"
+
+# A rollback cut short resumes where it stopped: redoing the Adds would delete the restored original dir.
+mkdir -p "$T/sysj/d"; echo orig >"$T/sysj/d/x"
+printf 'keep\0%s\0%s\0add\0%s\0add\0%s\0undone\0undone\0undone\0' \
+  "$T/sysj/d" "$T/sysj/.ovenv-old.d" "$T/sysj/d" "$T/sysj/d/x" >.ovenv/journal
+ov discard 2>/dev/null || fail "discard after a finished rollback"
+[[ $(cat "$T/sysj/d/x") == orig ]] || fail "replayed rollback deleted the restored dir"
+mv "$T/sysj/d" "$T/sysj/.ovenv-old.d"
+printf 'keep\0%s\0%s\0add\0%s\0add\0%s\0undone\0undone\0' \
+  "$T/sysj/d" "$T/sysj/.ovenv-old.d" "$T/sysj/d" "$T/sysj/d/x" >.ovenv/journal
+ov discard 2>/dev/null || fail "discard after a half-done rollback"
+[[ $(cat "$T/sysj/d/x") == orig && ! -e $T/sysj/.ovenv-old.d ]] || fail "half-done rollback not resumed"
+
+# A committed apply that got as far as removing the state dir is still finished by apply.
+ov run true
+st=$(cat .ovenv/state); chmod -R u+rwx "$st"; rm -rf "$st"
+printf 'commit\0' >.ovenv/journal
+err=$(ov apply 2>&1) && fail "apply over a committed journal didn't stop"
+grep -q "finished an interrupted apply" <<<"$err" || fail "committed journal not finished by apply: $err"
+[[ ! -e .ovenv/journal && ! -e .ovenv/state ]] || fail "committed journal or state left behind"
+
 # Staging /var/tmp moves the state to /tmp, with a warning.
 mkdir -p "$T/fallback/.ovenv"; cd "$T/fallback"
 echo /var/tmp >.ovenv/paths

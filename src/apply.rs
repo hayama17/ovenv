@@ -8,12 +8,13 @@ use std::io::Read;
 use std::os::unix::fs::{
     fchown, lchown, symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::baseline::{host_state, read_base};
-use crate::changes::{changes, Kind};
+use crate::changes::{changes, Change, Kind};
 use crate::env::{lock, Env, Mode};
-use crate::files::{copy_xattrs, hex, is_dir, lstat, unlock_tree};
+use crate::files::{copy_xattrs, hex, is_dir, lstat, sync_path, unlock_tree};
+use crate::journal::{Journal, Step};
 use crate::or_die;
 
 pub(crate) fn random_suffix() -> String {
@@ -30,58 +31,82 @@ pub(crate) fn own(env: &Env, m: &Metadata, p: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Put a copy of regular file or symlink `up` at `h` with rename(2), so `h` is never missing or half-written.
-pub(crate) fn put(env: &Env, up: &Path, h: &Path) -> Result<(), String> {
-    let dir = h.parent().unwrap_or(Path::new("/"));
-    let um =
-        lstat(up).ok_or_else(|| format!("{} vanished from the staged changes", h.display()))?;
-    let tmp = loop {
-        let tmp = dir.join(format!(".ovenv.{}", random_suffix()));
-        let made = if um.file_type().is_symlink() {
-            fs::read_link(up)
-                .and_then(|t| symlink(t, &tmp))
-                .and_then(|()| {
-                    copy_xattrs(up, &tmp).inspect_err(|_| {
-                        let _ = fs::remove_file(&tmp);
-                    })
-                })
-        } else {
-            (|| {
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
-                let prepared = (|| {
-                    io::copy(&mut File::open(up)?, &mut f)?;
-                    if env.mode == Mode::Root {
-                        fchown(&f, Some(um.uid()), Some(um.gid()))?;
-                    }
-                    // after chown, which clears setuid bits
-                    f.set_permissions(fs::Permissions::from_mode(um.mode() & 0o7777))?;
-                    copy_xattrs(up, &tmp)
-                })();
-                if prepared.is_err() {
-                    let _ = fs::remove_file(&tmp);
-                }
-                prepared
-            })()
-        };
-        match made {
-            Ok(()) => break tmp,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(format!(
-                    "cannot prepare {}: {e}; left it unchanged",
-                    h.display()
-                ))
+/// Write a copy of regular file or symlink `up` to `tmp`, which must not exist yet.
+fn prepare(env: &Env, up: &Path, tmp: &Path) -> io::Result<()> {
+    let um = fs::symlink_metadata(up)?;
+    let made = if um.file_type().is_symlink() {
+        fs::read_link(up)
+            .and_then(|t| symlink(t, tmp))
+            .and_then(|()| copy_xattrs(up, tmp))
+    } else {
+        (|| {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(tmp)?;
+            io::copy(&mut File::open(up)?, &mut f)?;
+            if env.mode == Mode::Root {
+                fchown(&f, Some(um.uid()), Some(um.gid()))?;
             }
-        }
+            // after chown, which clears setuid bits
+            f.set_permissions(fs::Permissions::from_mode(um.mode() & 0o7777))?;
+            copy_xattrs(up, tmp)
+        })()
     };
-    fs::rename(&tmp, h).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("cannot replace {}: {e}; left it unchanged", h.display())
-    })
+    if made.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    made
+}
+
+/// A name next to `h` that nothing uses yet.
+fn unused(h: &Path, tag: &str) -> PathBuf {
+    let dir = h.parent().unwrap_or(Path::new("/"));
+    loop {
+        let p = dir.join(format!("{tag}{}", random_suffix()));
+        if lstat(&p).is_none() {
+            return p;
+        }
+    }
+}
+
+/// Move whatever is at `h` aside, so rollback can put it back.
+fn set_aside(j: &mut Journal, h: &Path) -> Result<(), String> {
+    if lstat(h).is_none() {
+        return Ok(());
+    }
+    let old = unused(h, ".ovenv-old.");
+    j.log([Step::Keep {
+        host: h.to_path_buf(),
+        old: old.clone(),
+    }])?;
+    fs::rename(h, &old).map_err(|e| format!("cannot move {} aside: {e}", h.display()))?;
+    // Later steps' rollback assumes the original is out of the way, even after a power loss.
+    sync_path(h.parent().unwrap_or(Path::new("/")));
+    Ok(())
+}
+
+/// Put a copy of regular file or symlink `up` at `h` with rename(2), so an existing `h` is never missing or half-written.
+fn put(env: &Env, j: &mut Journal, up: &Path, h: &Path) -> Result<(), String> {
+    let tmp = unused(h, ".ovenv.");
+    // An existing file (MODIFY, or ADD with --force) stays reachable as a hard link until commit.
+    let keep = lstat(h).is_some().then(|| unused(h, ".ovenv-old."));
+    let step = match &keep {
+        Some(old) => Step::Keep {
+            host: h.to_path_buf(),
+            old: old.clone(),
+        },
+        None => Step::Add(h.to_path_buf()),
+    };
+    j.log([Step::Temp(tmp.clone()), step])?;
+    prepare(env, up, &tmp).map_err(|e| format!("cannot prepare {}: {e}", h.display()))?;
+    if let Some(old) = &keep {
+        // ponytail: needs hard links in the target dir; copy the old file instead if a filesystem lacks them
+        fs::hard_link(h, old).map_err(|e| format!("cannot keep the old {}: {e}", h.display()))?;
+        sync_path(h.parent().unwrap_or(Path::new("/")));
+    }
+    fs::rename(&tmp, h).map_err(|e| format!("cannot replace {}: {e}", h.display()))
 }
 
 pub(crate) fn remove(p: &Path) -> io::Result<()> {
@@ -148,59 +173,75 @@ pub(crate) fn apply(env: &Env, force: bool, drop_skipped: bool) {
         }
     }
 
-    let mut dirmodes = Vec::new();
+    let mut j = Journal::create(env).unwrap_or_else(|e| die!("{e}"));
     let mut skipped = Vec::new();
-    for c in &list {
+    if let Err(e) = write_all(env, &mut j, &list, &mut skipped).and_then(|()| j.sync_host()) {
+        match j.rollback(env) {
+            Ok(()) => die!("{e}; rolled back, the host is unchanged"),
+            Err(r) => die!("{e}; {r}; fix it and rerun ovenv to finish the rollback"),
+        }
+    }
+    if let Err(e) = j.commit(env) {
+        die!("applied, but {e}; rerun ovenv to finish");
+    }
+    for s in &skipped {
+        println!("not applied: {s}");
+    }
+    println!("applied {} change(s)", list.len() - skipped.len());
+}
+
+fn write_all(
+    env: &Env,
+    j: &mut Journal,
+    list: &[Change],
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut dirmodes = Vec::new();
+    for c in list {
         let h = &c.host;
-        let fail = |e: io::Error| die!("{}: {e}", h.display());
+        let fail = |e: io::Error| format!("{}: {e}", h.display());
+        let staged = || {
+            lstat(&c.up).ok_or_else(|| format!("{} vanished from the staged changes", h.display()))
+        };
         match c.kind {
             Kind::Skip => skipped.push(format!("{} ({})", h.display(), c.note)),
-            Kind::Delete => remove(h).unwrap_or_else(fail),
+            Kind::Delete => set_aside(j, h)?,
             Kind::Attr => {
-                let um = lstat(&c.up)
-                    .unwrap_or_else(|| die!("{} vanished from the staged changes", h.display()));
-                own(env, &um, h).unwrap_or_else(fail);
+                let um = staged()?;
+                j.log([Step::attr(h).map_err(fail)?])?;
+                own(env, &um, h).map_err(fail)?;
                 if um.is_dir() {
                     dirmodes.push((h.clone(), um.mode()));
                 } else {
                     fs::set_permissions(h, fs::Permissions::from_mode(um.mode() & 0o7777))
-                        .unwrap_or_else(fail);
+                        .map_err(fail)?;
                 }
-                copy_xattrs(&c.up, h).unwrap_or_else(fail);
+                copy_xattrs(&c.up, h).map_err(fail)?;
             }
             Kind::Add | Kind::Replace | Kind::Modify => {
                 if c.kind == Kind::Replace {
-                    remove(h).unwrap_or_else(fail);
+                    set_aside(j, h)?;
                 }
                 if is_dir(&c.up) {
-                    let um = lstat(&c.up).unwrap_or_else(|| {
-                        die!("{} vanished from the staged changes", h.display())
-                    });
-                    fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(h)
-                        .unwrap_or_else(fail);
-                    own(env, &um, h).unwrap_or_else(fail);
-                    copy_xattrs(&c.up, h).unwrap_or_else(fail);
+                    let um = staged()?;
+                    j.log([Step::Add(h.clone())])?;
+                    fs::DirBuilder::new().mode(0o700).create(h).map_err(fail)?;
+                    own(env, &um, h).map_err(fail)?;
+                    copy_xattrs(&c.up, h).map_err(fail)?;
                     dirmodes.push((h.clone(), um.mode()));
                 } else {
-                    put(env, &c.up, h).unwrap_or_else(|e| die!("{e}"));
+                    put(env, j, &c.up, h)?;
                 }
             }
         }
     }
     // Directory modes go last, deepest first, so a read-only directory doesn't block writes below it.
     for (h, mode) in dirmodes.iter().rev() {
-        or_die(
-            fs::set_permissions(h, fs::Permissions::from_mode(mode & 0o7777)),
-            h.display(),
-        );
+        let fail = |e: io::Error| format!("{}: {e}", h.display());
+        j.log([Step::attr(h).map_err(fail)?])?;
+        fs::set_permissions(h, fs::Permissions::from_mode(mode & 0o7777)).map_err(fail)?;
     }
-    for s in &skipped {
-        println!("not applied: {s}");
-    }
-    println!("applied {} change(s)", list.len() - skipped.len());
-    discard_files(env);
+    Ok(())
 }
 
 /// Remove the staged state; .ovenv/paths stays.

@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 use crate::env::Env;
 use crate::sys::cstr;
 
+/// fsync `p` (a directory, for renames and removals in it), or everything when it can't be opened.
+pub(crate) fn sync_path(p: &Path) {
+    if File::open(p).and_then(|f| f.sync_all()).is_err() {
+        // SAFETY: sync(2) takes no arguments and cannot fail.
+        unsafe { libc::sync() };
+    }
+}
+
 pub(crate) fn lstat(p: &Path) -> Option<Metadata> {
     fs::symlink_metadata(p).ok()
 }
@@ -205,9 +213,13 @@ pub(crate) fn kind_name(m: &Metadata) -> &'static str {
 /// Give `to` the xattrs of `from`. changes() only lets entries through whose xattrs match the host,
 /// so this keeps the host's xattrs on a new inode, and restores file capabilities that chown clears.
 pub(crate) fn copy_xattrs(from: &Path, to: &Path) -> io::Result<()> {
+    set_xattrs(to, &xattrs(from))
+}
+
+pub(crate) fn set_xattrs(to: &Path, list: &[(Vec<u8>, Vec<u8>)]) -> io::Result<()> {
     let c = cstr(to);
-    for (name, value) in xattrs(from) {
-        let n = CString::new(name).map_err(io::Error::other)?;
+    for (name, value) in list {
+        let n = CString::new(name.as_slice()).map_err(io::Error::other)?;
         let r = unsafe {
             libc::lsetxattr(
                 c.as_ptr(),

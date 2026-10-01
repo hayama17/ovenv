@@ -10,6 +10,7 @@ mod changes;
 mod diff;
 mod env;
 mod files;
+mod journal;
 mod run;
 mod sys;
 
